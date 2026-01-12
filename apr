@@ -272,7 +272,7 @@ print_step() {
     local total="$2"
     local text="$3"
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
-        gum style --foreground 212 --bold "[$step/$total]" --faint " $text" >&2
+        echo "$(gum style --foreground 212 --bold "[$step/$total]") $(gum style --faint "$text")" >&2
     else
         echo -e "${BOLD}${MAGENTA}[$step/$total]${NC} ${DIM}$text${NC}" >&2
     fi
@@ -359,11 +359,10 @@ file_picker() {
 # -----------------------------------------------------------------------------
 
 ensure_config_dir() {
-    if [[ ! -d "$CONFIG_DIR" ]]; then
-        mkdir -p "$CONFIG_DIR"
-        mkdir -p "$CONFIG_DIR/rounds"
-        mkdir -p "$CONFIG_DIR/templates"
-    fi
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$CONFIG_DIR/workflows"
+    mkdir -p "$CONFIG_DIR/rounds"
+    mkdir -p "$CONFIG_DIR/templates"
 }
 
 load_config() {
@@ -386,7 +385,8 @@ load_config() {
 get_config_value() {
     local key="$1"
     local config_file="$2"
-    grep "^${key}:" "$config_file" 2>/dev/null | cut -d':' -f2- | sed 's/^[[:space:]]*//'
+    # Handle both top-level and nested YAML keys (with optional leading whitespace)
+    grep -E "^[[:space:]]*${key}:" "$config_file" 2>/dev/null | head -1 | cut -d':' -f2- | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//'
 }
 
 # -----------------------------------------------------------------------------
