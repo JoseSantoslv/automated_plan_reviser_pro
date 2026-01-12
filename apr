@@ -1127,6 +1127,330 @@ show_history() {
     done
 }
 
+# =============================================================================
+# ROBOT MODE - JSON API for coding agents
+# =============================================================================
+#
+# All robot mode output goes to stdout as valid JSON.
+# Response envelope: { ok, code, data, hint?, meta: {v, ts} }
+#
+# Error codes: ok, not_configured, not_found, validation_failed, oracle_error
+# =============================================================================
+
+# Robot mode state
+# shellcheck disable=SC2034  # State flag for helper functions
+ROBOT_MODE=false
+ROBOT_COMPACT=false
+
+# ISO8601 timestamp
+iso_timestamp() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# Build JSON response using jq (required for robot mode)
+# Usage: robot_json ok|false code data_json [hint]
+robot_json() {
+    local ok="$1"
+    local code="$2"
+    local data="$3"
+    local hint="${4:-}"
+    local ts
+    ts=$(iso_timestamp)
+
+    local result
+    if [[ -n "$hint" ]]; then
+        result=$(jq -nc \
+            --argjson ok "$ok" \
+            --arg code "$code" \
+            --argjson data "$data" \
+            --arg hint "$hint" \
+            --arg v "$VERSION" \
+            --arg ts "$ts" \
+            '{ok: $ok, code: $code, data: $data, hint: $hint, meta: {v: $v, ts: $ts}}')
+    else
+        result=$(jq -nc \
+            --argjson ok "$ok" \
+            --arg code "$code" \
+            --argjson data "$data" \
+            --arg v "$VERSION" \
+            --arg ts "$ts" \
+            '{ok: $ok, code: $code, data: $data, meta: {v: $v, ts: $ts}}')
+    fi
+
+    if [[ "$ROBOT_COMPACT" == "true" ]]; then
+        echo "$result"
+    else
+        echo "$result" | jq .
+    fi
+}
+
+# Robot: Status - System overview
+robot_status() {
+    local configured=false
+    local default_workflow=""
+    local workflow_count=0
+    local oracle_available=false
+    local oracle_method=""
+    local workflows_json="[]"
+
+    # Check configuration
+    if [[ -d "$CONFIG_DIR" && -f "$CONFIG_DIR/config.yaml" ]]; then
+        configured=true
+        default_workflow=$(get_config_value "default_workflow" "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "")
+    fi
+
+    # Count and list workflows
+    if [[ -d "$CONFIG_DIR/workflows" ]]; then
+        workflow_count=$(find "$CONFIG_DIR/workflows" -name "*.yaml" 2>/dev/null | wc -l | tr -d ' ')
+        local wf_list=()
+        for wf in "$CONFIG_DIR/workflows"/*.yaml; do
+            [[ -f "$wf" ]] || continue
+            wf_list+=("\"$(basename "$wf" .yaml)\"")
+        done
+        if [[ ${#wf_list[@]} -gt 0 ]]; then
+            workflows_json="[$(IFS=,; echo "${wf_list[*]}")]"
+        fi
+    fi
+
+    # Check Oracle
+    if command -v oracle &>/dev/null; then
+        oracle_available=true
+        oracle_method="global"
+    elif command -v npx &>/dev/null; then
+        oracle_available=true
+        oracle_method="npx"
+    fi
+
+    # Build data object with jq
+    local data
+    data=$(jq -nc \
+        --argjson configured "$configured" \
+        --arg default_workflow "$default_workflow" \
+        --argjson workflow_count "$workflow_count" \
+        --argjson workflows "$workflows_json" \
+        --argjson oracle_available "$oracle_available" \
+        --arg oracle_method "$oracle_method" \
+        --arg config_dir "$CONFIG_DIR" \
+        --arg apr_home "$APR_HOME" \
+        '{
+            configured: $configured,
+            default_workflow: $default_workflow,
+            workflow_count: $workflow_count,
+            workflows: $workflows,
+            oracle_available: $oracle_available,
+            oracle_method: $oracle_method,
+            config_dir: $config_dir,
+            apr_home: $apr_home
+        }')
+
+    local hint=""
+    if [[ "$configured" == "false" ]]; then
+        hint="Run 'apr robot init' to initialize, then 'apr setup' to create workflow"
+    elif [[ "$oracle_available" == "false" ]]; then
+        hint="Install Oracle: npm install -g @steipete/oracle"
+    fi
+
+    robot_json true "ok" "$data" "$hint"
+}
+
+# Robot: Workflows - List all workflows
+robot_workflows() {
+    if [[ ! -d "$CONFIG_DIR/workflows" ]]; then
+        robot_json false "not_configured" '{"workflows":[]}' "Run 'apr robot init' then 'apr setup'"
+        return 1
+    fi
+
+    local items=()
+    for wf in "$CONFIG_DIR/workflows"/*.yaml; do
+        [[ -f "$wf" ]] || continue
+        local name desc
+        name=$(basename "$wf" .yaml)
+        desc=$(get_config_value "description" "$wf" 2>/dev/null || echo "")
+        items+=("$(jq -nc --arg name "$name" --arg desc "$desc" '{name: $name, description: $desc}')")
+    done
+
+    local workflows_json="[]"
+    if [[ ${#items[@]} -gt 0 ]]; then
+        workflows_json=$(printf '%s\n' "${items[@]}" | jq -sc .)
+    fi
+
+    robot_json true "ok" "{\"workflows\":$workflows_json}"
+}
+
+# Robot: Init - Initialize .apr directory
+robot_init() {
+    if [[ -d "$CONFIG_DIR" ]]; then
+        robot_json true "ok" '{"created":false,"existed":true}' "Already initialized"
+        return 0
+    fi
+
+    mkdir -p "$CONFIG_DIR/workflows" "$CONFIG_DIR/rounds" "$CONFIG_DIR/templates"
+    echo "default_workflow: default" > "$CONFIG_DIR/config.yaml"
+
+    robot_json true "ok" '{"created":true,"existed":false}'
+}
+
+# Robot: Validate - Pre-run validation
+robot_validate() {
+    local round_num="${1:-}"
+    local errors=()
+    local warnings=()
+
+    if [[ -z "$round_num" ]]; then
+        errors+=("Round number required")
+    fi
+
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        errors+=("Not initialized - run 'apr robot init'")
+    fi
+
+    local wf_file="$CONFIG_DIR/workflows/${WORKFLOW}.yaml"
+    if [[ ! -f "$wf_file" ]]; then
+        errors+=("Workflow '$WORKFLOW' not found")
+    else
+        # Check required documents exist
+        local readme spec
+        readme=$(get_config_value "readme" "$wf_file" 2>/dev/null || echo "")
+        spec=$(get_config_value "spec" "$wf_file" 2>/dev/null || echo "")
+
+        if [[ -n "$readme" && ! -f "$readme" ]]; then
+            errors+=("README not found: $readme")
+        fi
+        if [[ -n "$spec" && ! -f "$spec" ]]; then
+            errors+=("Spec not found: $spec")
+        fi
+    fi
+
+    # Check Oracle
+    if ! command -v oracle &>/dev/null && ! command -v npx &>/dev/null; then
+        errors+=("Oracle not available")
+    fi
+
+    # Check for previous round if not round 1
+    if [[ "$round_num" =~ ^[0-9]+$ ]] && [[ "$round_num" -gt 1 ]]; then
+        local prev=$((round_num - 1))
+        local prev_file="$CONFIG_DIR/rounds/$WORKFLOW/round_${prev}.md"
+        if [[ ! -f "$prev_file" ]]; then
+            warnings+=("Previous round $prev not found - starting fresh?")
+        fi
+    fi
+
+    local valid=true
+    [[ ${#errors[@]} -gt 0 ]] && valid=false
+
+    local errors_json warnings_json
+    errors_json=$(printf '%s\n' "${errors[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+    warnings_json=$(printf '%s\n' "${warnings[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+
+    local data
+    data=$(jq -nc \
+        --argjson valid "$valid" \
+        --argjson errors "$errors_json" \
+        --argjson warnings "$warnings_json" \
+        --arg workflow "$WORKFLOW" \
+        --arg round "$round_num" \
+        '{valid: $valid, errors: $errors, warnings: $warnings, workflow: $workflow, round: $round}')
+
+    if [[ "$valid" == "true" ]]; then
+        robot_json true "ok" "$data"
+    else
+        robot_json false "validation_failed" "$data" "Fix errors before running"
+        return 1
+    fi
+}
+
+# Robot: Help - Show robot mode help in JSON
+robot_help() {
+    local data
+    data=$(jq -nc '{
+        description: "Robot mode for coding agents - JSON interface to APR",
+        usage: "apr robot <command> [args] [--compact]",
+        commands: {
+            status: "System overview (config, workflows, oracle)",
+            workflows: "List all workflows",
+            init: "Initialize .apr directory",
+            validate: "Pre-run validation (apr robot validate <round>)",
+            help: "This help"
+        },
+        options: {
+            "-w, --workflow": "Workflow name",
+            "--compact": "Minified JSON output"
+        },
+        examples: [
+            "apr robot status",
+            "apr robot workflows",
+            "apr robot validate 1 -w myspec"
+        ]
+    }')
+
+    robot_json true "ok" "$data"
+}
+
+# Robot: Main dispatcher
+cmd_robot() {
+    # shellcheck disable=SC2034  # State flag for helper functions
+    ROBOT_MODE=true
+
+    # Check jq is available (required for robot mode)
+    if ! command -v jq &>/dev/null; then
+        echo '{"ok":false,"code":"dependency_missing","data":{},"hint":"Robot mode requires jq. Install with: apt install jq"}' >&2
+        exit $EXIT_DEPENDENCY_ERROR
+    fi
+
+    # Parse robot-specific options
+    local robot_cmd=""
+    local robot_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --compact)
+                ROBOT_COMPACT=true
+                shift
+                ;;
+            -w|--workflow)
+                WORKFLOW="$2"
+                shift 2
+                ;;
+            -*)
+                robot_json false "invalid_option" "{\"option\":\"$1\"}" "Unknown option: $1"
+                exit $EXIT_USAGE_ERROR
+                ;;
+            *)
+                if [[ -z "$robot_cmd" ]]; then
+                    robot_cmd="$1"
+                else
+                    robot_args+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    robot_cmd="${robot_cmd:-help}"
+
+    case "$robot_cmd" in
+        status)
+            robot_status
+            ;;
+        workflows)
+            robot_workflows
+            ;;
+        init)
+            robot_init
+            ;;
+        validate)
+            robot_validate "${robot_args[0]:-}"
+            ;;
+        help|--help|-h)
+            robot_help
+            ;;
+        *)
+            robot_json false "unknown_command" "{\"command\":\"$robot_cmd\"}" "Unknown command. Try 'apr robot help'"
+            exit $EXIT_USAGE_ERROR
+            ;;
+    esac
+}
+
 # -----------------------------------------------------------------------------
 # Help
 # -----------------------------------------------------------------------------
@@ -1157,6 +1481,9 @@ show_help() {
         echo "    $(gum style --foreground 82 'history')            Show revision history" >&2
         echo "    $(gum style --foreground 82 'update')             Check for and install updates" >&2
         echo "    $(gum style --foreground 82 'help')               Show this help message" >&2
+        echo "" >&2
+        gum style --foreground 39 "  Automation" >&2
+        echo "    $(gum style --foreground 82 'robot')              Machine-friendly CLI for coding agents" >&2
         echo "" >&2
 
         gum style --foreground 214 --bold "OPTIONS" >&2
@@ -1196,6 +1523,9 @@ show_help() {
         gum style --foreground 39 "  # Check session status" >&2
         echo "  apr status" >&2
         echo "" >&2
+        gum style --foreground 39 "  # Robot mode (for coding agents)" >&2
+        echo "  apr robot status" >&2
+        echo "" >&2
 
         gum style --foreground 214 --bold "EXIT CODES" >&2
         gum style --faint "  0   Success" >&2
@@ -1229,6 +1559,9 @@ show_help() {
         echo -e "    ${GREEN}update${NC}             Check for and install updates" >&2
         echo -e "    ${GREEN}help${NC}               Show this help message" >&2
         echo "" >&2
+        echo -e "  ${CYAN}Automation${NC}" >&2
+        echo -e "    ${GREEN}robot${NC}              Machine-friendly CLI for coding agents" >&2
+        echo "" >&2
         echo -e "${BOLD}${YELLOW}OPTIONS${NC}" >&2
         echo "  -w, --workflow NAME  Workflow to use (default: from config)" >&2
         echo "  -i, --include-impl   Include implementation document" >&2
@@ -1254,6 +1587,7 @@ show_help() {
         echo "  apr run 2 --include-impl     # Include implementation doc" >&2
         echo "  apr run 1 --login --wait     # First run with manual login" >&2
         echo "  apr status                   # Check session status" >&2
+        echo "  apr robot status             # Robot mode (for agents)" >&2
         echo "" >&2
         echo -e "${BOLD}${YELLOW}EXIT CODES${NC}" >&2
         echo "  0   Success" >&2
@@ -1301,7 +1635,7 @@ main() {
 
     # Check Oracle availability (not needed for some commands)
     local command="${1:-help}"
-    if [[ "$command" != "help" && "$command" != "update" && "$command" != "--help" && "$command" != "-h" ]]; then
+    if [[ "$command" != "help" && "$command" != "update" && "$command" != "robot" && "$command" != "--help" && "$command" != "-h" ]]; then
         if ! check_oracle; then
             print_error "Oracle not found"
             print_info "Install with: npm install -g @steipete/oracle"
@@ -1312,6 +1646,18 @@ main() {
 
     # Parse command and options
     shift || true
+
+    # Robot mode handles its own argument parsing
+    if [[ "$command" == "robot" ]]; then
+        # Initialize workflow variable for robot commands that need it
+        WORKFLOW=""
+        if [[ -f "$CONFIG_DIR/config.yaml" ]]; then
+            WORKFLOW=$(get_config_value "default_workflow" "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "")
+        fi
+        WORKFLOW="${WORKFLOW:-default}"
+        cmd_robot "$@"
+        exit $?
+    fi
 
     # Global options
     WORKFLOW=""
