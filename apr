@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# apr - Automated Plan Reviser Pro (v1.0.0)
+# apr - Automated Plan Reviser Pro (v1.1.0)
 # Iterative specification refinement with GPT Pro Extended Reasoning via Oracle
 #
 # FEATURES:
@@ -11,6 +11,8 @@
 #   - Session monitoring and reattachment
 #   - Configurable document bundles (README, spec, implementation)
 #   - Automatic template generation and round management
+#   - Self-update with checksum verification
+#   - Daily update checking (opt-in)
 #
 # Usage:
 #   apr [command] [options]
@@ -22,6 +24,7 @@
 #   attach <session>   Attach to a running/completed session
 #   list               List all configured workflows
 #   history            Show revision history for current workflow
+#   update             Check for and install updates
 #   help               Show help message
 #
 # Options:
@@ -33,44 +36,272 @@
 #   --wait             Wait for completion (blocking)
 #   --login            Manual login mode (first-time setup)
 #   --keep-browser     Keep browser open after completion
+#   -q, --quiet        Minimal output (errors only)
 #   --version          Show version
 #
+# Environment Variables:
+#   APR_HOME           Data directory (default: ~/.local/share/apr)
+#   APR_CACHE          Cache directory (default: ~/.cache/apr)
+#   APR_CHECK_UPDATES  Enable daily update check (set to 1)
+#   APR_NO_GUM         Disable gum even if available
+#   NO_COLOR           Disable colors (accessibility)
+#
+# More info: https://github.com/Dicklesworthstone/automated_plan_reviser_pro
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
+
+# GitHub repository info for updates
+readonly REPO_OWNER="Dicklesworthstone"
+readonly REPO_NAME="automated_plan_reviser_pro"
+readonly GITHUB_RAW="https://raw.githubusercontent.com"
+readonly VERSION_URL="${GITHUB_RAW}/${REPO_OWNER}/${REPO_NAME}/main/VERSION"
+readonly RELEASES_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
 
 # -----------------------------------------------------------------------------
-# Exit Codes
+# Exit Codes (semantic, non-contiguous for future additions)
 # -----------------------------------------------------------------------------
 readonly EXIT_SUCCESS=0
-readonly EXIT_USAGE_ERROR=2
-readonly EXIT_DEPENDENCY_ERROR=3
-readonly EXIT_CONFIG_ERROR=4
+# shellcheck disable=SC2034  # Reserved for future use
+readonly EXIT_PARTIAL_FAILURE=1   # Some operations failed
+readonly EXIT_USAGE_ERROR=2       # Bad arguments
+readonly EXIT_DEPENDENCY_ERROR=3  # Missing Oracle, Node.js, etc.
+readonly EXIT_CONFIG_ERROR=4      # Invalid config, missing files
+readonly EXIT_NETWORK_ERROR=10    # Timeout, DNS, unreachable
+readonly EXIT_UPDATE_ERROR=11     # Self-update failed
 
 # -----------------------------------------------------------------------------
-# Colors (fallback when gum not available)
+# Colors (conditional on TTY and NO_COLOR)
 # -----------------------------------------------------------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-WHITE='\033[1;37m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# Respect NO_COLOR environment variable for accessibility
+# Check stderr (-t 2) since all log output goes there
+if [[ -t 2 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    CYAN='\033[0;36m'
+    MAGENTA='\033[0;35m'
+    WHITE='\033[1;37m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' CYAN='' MAGENTA='' WHITE='' BOLD='' DIM='' NC=''
+fi
 
 # Gum availability flag
 GUM_AVAILABLE=false
 
-# Configuration
+# Quiet mode flag
+QUIET_MODE=false
+
+# Configuration (XDG-compliant with overrides)
 APR_HOME="${APR_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/apr}"
 APR_CACHE="${APR_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/apr}"
 CONFIG_DIR=".apr"
 
 # Oracle command (determined at runtime)
 ORACLE_CMD=""
+
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
+
+# Compare semantic versions. Returns 0 if $1 > $2
+version_gt() {
+    local v1="$1" v2="$2"
+    if command -v sort &> /dev/null && printf '%s\n' "$v1" "$v2" | sort -V &>/dev/null; then
+        [[ "$(printf '%s\n' "$v1" "$v2" | sort -V | tail -n1)" == "$v1" && "$v1" != "$v2" ]]
+    else
+        # Fallback to string comparison
+        [[ "$v1" > "$v2" ]]
+    fi
+}
+
+# Check if we can prompt the user (interactive terminal)
+can_prompt() {
+    [[ -t 0 && -t 2 && "$QUIET_MODE" != "true" ]]
+}
+
+# -----------------------------------------------------------------------------
+# Update Checking (Opt-In)
+# -----------------------------------------------------------------------------
+
+check_for_updates() {
+    # Only check if explicitly enabled
+    [[ -z "${APR_CHECK_UPDATES:-}" ]] && return 0
+
+    local check_file="${APR_HOME}/.last_update_check"
+    local one_day=86400
+
+    # Ensure directory exists
+    mkdir -p "$APR_HOME" 2>/dev/null || true
+
+    # Check if we already checked today
+    if [[ -f "$check_file" ]]; then
+        local last_check now
+        last_check=$(cat "$check_file" 2>/dev/null || echo "0")
+        now=$(date +%s)
+        if (( now - last_check < one_day )); then
+            return 0  # Skip - already checked today
+        fi
+    fi
+
+    # Fetch remote version with short timeout
+    local remote_version=""
+    if command -v curl &> /dev/null; then
+        remote_version=$(curl -fsSL --connect-timeout 2 --max-time 5 "$VERSION_URL" 2>/dev/null | tr -d '[:space:]') || true
+    elif command -v wget &> /dev/null; then
+        remote_version=$(wget -q --timeout=5 -O - "$VERSION_URL" 2>/dev/null | tr -d '[:space:]') || true
+    fi
+
+    # Update timestamp regardless of result
+    date +%s > "$check_file" 2>/dev/null || true
+
+    # Compare versions and notify if update available
+    if [[ -n "$remote_version" && "$remote_version" != "$VERSION" ]]; then
+        if version_gt "$remote_version" "$VERSION"; then
+            echo -e "${YELLOW}[apr]${NC} Update available: ${VERSION} → ${remote_version}" >&2
+            echo -e "${DIM}      Run 'apr update' to install${NC}" >&2
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Self-Update Command
+# -----------------------------------------------------------------------------
+
+cmd_update() {
+    print_banner
+
+    print_header "CHECKING FOR UPDATES"
+    echo "" >&2
+
+    # Fetch latest version
+    print_info "Fetching latest version info..."
+    local remote_version=""
+    if command -v curl &> /dev/null; then
+        remote_version=$(curl -fsSL --connect-timeout 5 --max-time 10 "$VERSION_URL" 2>/dev/null | tr -d '[:space:]') || true
+    elif command -v wget &> /dev/null; then
+        remote_version=$(wget -q --timeout=10 -O - "$VERSION_URL" 2>/dev/null | tr -d '[:space:]') || true
+    fi
+
+    if [[ -z "$remote_version" ]]; then
+        print_error "Failed to check for updates (network error)"
+        exit $EXIT_NETWORK_ERROR
+    fi
+
+    if [[ "$remote_version" == "$VERSION" ]]; then
+        print_success "Already up to date (v${VERSION})"
+        exit $EXIT_SUCCESS
+    fi
+
+    if ! version_gt "$remote_version" "$VERSION"; then
+        print_info "Current version (v${VERSION}) is newer than remote (v${remote_version})"
+        exit $EXIT_SUCCESS
+    fi
+
+    print_info "Update available: v${VERSION} → v${remote_version}"
+    echo "" >&2
+
+    # Prompt for confirmation if interactive
+    if can_prompt; then
+        if ! confirm "Install update?"; then
+            print_info "Update cancelled"
+            exit $EXIT_SUCCESS
+        fi
+    fi
+
+    # Create temp directory
+    local tmp_dir
+    tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t apr 2>/dev/null)
+    if [[ -z "$tmp_dir" || ! -d "$tmp_dir" ]]; then
+        print_error "Failed to create temp directory"
+        exit $EXIT_UPDATE_ERROR
+    fi
+
+    # Download new version
+    print_info "Downloading v${remote_version}..."
+    local download_url="${RELEASES_URL}/download/v${remote_version}/apr"
+    local checksum_url="${RELEASES_URL}/download/v${remote_version}/apr.sha256"
+
+    if command -v curl &> /dev/null; then
+        curl -fsSL "$download_url" -o "$tmp_dir/apr" 2>/dev/null || {
+            # Fallback to main branch if no release
+            curl -fsSL "${GITHUB_RAW}/${REPO_OWNER}/${REPO_NAME}/main/apr" -o "$tmp_dir/apr" 2>/dev/null
+        }
+    elif command -v wget &> /dev/null; then
+        wget -q "$download_url" -O "$tmp_dir/apr" 2>/dev/null || {
+            wget -q "${GITHUB_RAW}/${REPO_OWNER}/${REPO_NAME}/main/apr" -O "$tmp_dir/apr" 2>/dev/null
+        }
+    fi
+
+    if [[ ! -s "$tmp_dir/apr" ]]; then
+        print_error "Failed to download update"
+        rm -rf "$tmp_dir"
+        exit $EXIT_UPDATE_ERROR
+    fi
+
+    # Verify it's a bash script (security check)
+    local first_line=""
+    IFS= read -r first_line < "$tmp_dir/apr" 2>/dev/null || true
+    if [[ "$first_line" != "#!/usr/bin/env bash" ]]; then
+        print_error "Downloaded file is not a valid apr script"
+        rm -rf "$tmp_dir"
+        exit $EXIT_UPDATE_ERROR
+    fi
+
+    # Try to verify checksum (non-fatal if checksums not available)
+    local expected_checksum=""
+    if command -v curl &> /dev/null; then
+        expected_checksum=$(curl -fsSL "$checksum_url" 2>/dev/null | tr -d '[:space:]') || true
+    elif command -v wget &> /dev/null; then
+        expected_checksum=$(wget -q -O - "$checksum_url" 2>/dev/null | tr -d '[:space:]') || true
+    fi
+
+    if [[ -n "$expected_checksum" ]]; then
+        print_info "Verifying checksum..."
+        local actual_checksum=""
+        if command -v sha256sum &> /dev/null; then
+            actual_checksum=$(sha256sum "$tmp_dir/apr" | cut -d' ' -f1)
+        elif command -v shasum &> /dev/null; then
+            actual_checksum=$(shasum -a 256 "$tmp_dir/apr" | cut -d' ' -f1)
+        fi
+
+        if [[ -n "$actual_checksum" && "$actual_checksum" != "$expected_checksum" ]]; then
+            print_error "Checksum verification failed!"
+            print_error "Expected: $expected_checksum"
+            print_error "Got:      $actual_checksum"
+            rm -rf "$tmp_dir"
+            exit $EXIT_UPDATE_ERROR
+        fi
+        print_success "Checksum verified"
+    else
+        print_warning "Checksum not available (installing from main branch)"
+    fi
+
+    # Find where we're installed
+    local script_path="${BASH_SOURCE[0]}"
+    script_path=$(realpath "$script_path" 2>/dev/null || readlink -f "$script_path" 2>/dev/null || echo "$script_path")
+
+    # Install update
+    print_info "Installing to $script_path..."
+    chmod +x "$tmp_dir/apr"
+
+    if [[ -w "$script_path" ]]; then
+        mv "$tmp_dir/apr" "$script_path"
+    elif command -v sudo &> /dev/null; then
+        sudo mv "$tmp_dir/apr" "$script_path"
+    else
+        print_error "Cannot write to $script_path (try running with sudo)"
+        rm -rf "$tmp_dir"
+        exit $EXIT_UPDATE_ERROR
+    fi
+
+    rm -rf "$tmp_dir"
+    print_success "Updated to v${remote_version}!"
+}
 
 # -----------------------------------------------------------------------------
 # Gum Installation & Detection
@@ -142,12 +373,16 @@ gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
 }
 
 check_gum() {
+    # Respect APR_NO_GUM
+    [[ -n "${APR_NO_GUM:-}" ]] && return 1
+
     if command -v gum &> /dev/null; then
         GUM_AVAILABLE=true
         return 0
     fi
 
-    if [[ -t 1 && -z "${CI:-}" && -z "${APR_NO_GUM:-}" ]]; then
+    # Only try to install if interactive and not in CI
+    if [[ -t 1 && -z "${CI:-}" ]]; then
         if try_install_gum; then
             if [[ -x "${HOME}/.local/bin/gum" && ":$PATH:" != *":${HOME}/.local/bin:"* ]]; then
                 export PATH="${HOME}/.local/bin:${PATH}"
@@ -183,6 +418,8 @@ check_oracle() {
 # -----------------------------------------------------------------------------
 
 print_banner() {
+    [[ "$QUIET_MODE" == "true" ]] && return
+
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum style \
             --border double \
@@ -204,6 +441,7 @@ print_banner() {
 }
 
 print_header() {
+    [[ "$QUIET_MODE" == "true" ]] && return
     local text="$1"
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum style --foreground 214 --bold "$text" >&2
@@ -213,6 +451,7 @@ print_header() {
 }
 
 print_success() {
+    [[ "$QUIET_MODE" == "true" ]] && return
     local text="$1"
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum style --foreground 82 "✓ $text" >&2
@@ -240,6 +479,7 @@ print_warning() {
 }
 
 print_info() {
+    [[ "$QUIET_MODE" == "true" ]] && return
     local text="$1"
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum style --foreground 39 "ℹ $text" >&2
@@ -249,6 +489,7 @@ print_info() {
 }
 
 print_dim() {
+    [[ "$QUIET_MODE" == "true" ]] && return
     local text="$1"
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum style --faint "$text" >&2
@@ -258,6 +499,7 @@ print_dim() {
 }
 
 print_step() {
+    [[ "$QUIET_MODE" == "true" ]] && return
     local step="$1"
     local total="$2"
     local text="$3"
@@ -271,21 +513,40 @@ print_step() {
 spin() {
     local text="$1"
     shift
-    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+    if [[ "$GUM_AVAILABLE" == "true" && "$QUIET_MODE" != "true" ]]; then
         gum spin --spinner dot --title "$text" -- "$@"
     else
-        echo -e "${CYAN}◐${NC} $text" >&2
+        [[ "$QUIET_MODE" != "true" ]] && echo -e "${CYAN}→${NC} $text" >&2
         "$@"
     fi
 }
 
 confirm() {
     local prompt="$1"
+    local default="${2:-false}"
+
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum confirm "$prompt"
     else
-        read -rp "$prompt [y/N] " response
-        [[ "$response" =~ ^[Yy]$ ]]
+        if ! can_prompt; then
+            [[ "$default" == "true" ]]
+            return $?
+        fi
+
+        local yn
+        if [[ "$default" == "true" ]]; then
+            read -rp "$prompt [Y/n] " yn
+            case "${yn,,}" in
+                n|no) return 1 ;;
+                *) return 0 ;;
+            esac
+        else
+            read -rp "$prompt [y/N] " yn
+            case "${yn,,}" in
+                y|yes) return 0 ;;
+                *) return 1 ;;
+            esac
+        fi
     fi
 }
 
@@ -367,8 +628,6 @@ load_config() {
         return 1
     fi
 
-    # Source the config (simple key=value format for now)
-    # In a real implementation, we'd use yq or similar
     echo "$config_path"
 }
 
@@ -610,7 +869,7 @@ run_round() {
         slug="${slug}-with-impl"
     fi
 
-    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+    if [[ "$GUM_AVAILABLE" == "true" && "$QUIET_MODE" != "true" ]]; then
         gum style \
             --border rounded \
             --border-foreground 212 \
@@ -622,7 +881,7 @@ run_round() {
             "$(gum style --foreground 39 "Model:") $model" \
             "$(gum style --foreground 39 "Include impl:") $include_impl" \
             "$(gum style --foreground 39 "Output:") $output_file" >&2
-    else
+    elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "${MAGENTA}╭────────────────────────────────────────────────────────────╮${NC}" >&2
         echo -e "${MAGENTA}│${NC}  ${BOLD}REVISION ROUND $round_num${NC}" >&2
         echo -e "${MAGENTA}│${NC}" >&2
@@ -756,7 +1015,7 @@ with the git-diff style change versus the original plan shown below:
         print_success "Oracle running in background (PID: $oracle_pid)"
         echo "" >&2
 
-        if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        if [[ "$GUM_AVAILABLE" == "true" && "$QUIET_MODE" != "true" ]]; then
             gum style \
                 --border rounded \
                 --border-foreground 39 \
@@ -766,7 +1025,7 @@ with the git-diff style change versus the original plan shown below:
                 "Check status:      $(gum style --foreground 82 "apr status")" \
                 "Attach to session: $(gum style --foreground 82 "apr attach $slug")" \
                 "View with output:  $(gum style --foreground 82 "$ORACLE_CMD session $slug --render")" >&2
-        else
+        elif [[ "$QUIET_MODE" != "true" ]]; then
             echo -e "${CYAN}╭────────────────────────────────────────────────────────────╮${NC}" >&2
             echo -e "${CYAN}│${NC}  ${BOLD}MONITORING COMMANDS${NC}" >&2
             echo -e "${CYAN}├────────────────────────────────────────────────────────────┤${NC}" >&2
@@ -877,18 +1136,27 @@ show_help() {
     print_banner
 
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --foreground 214 --bold "DESCRIPTION" >&2
+        gum style --padding "0 2" "Automated Plan Reviser Pro automates iterative specification" >&2
+        gum style --padding "0 2" "refinement using GPT Pro Extended Reasoning via Oracle." >&2
+        echo "" >&2
+
         gum style --foreground 214 --bold "SYNOPSIS" >&2
         echo "  apr [command] [options]" >&2
         echo "" >&2
 
         gum style --foreground 214 --bold "COMMANDS" >&2
-        echo "  $(gum style --foreground 82 'run <round>')        Run a revision round" >&2
-        echo "  $(gum style --foreground 82 'setup')              Interactive workflow setup wizard" >&2
-        echo "  $(gum style --foreground 82 'status')             Check Oracle session status" >&2
-        echo "  $(gum style --foreground 82 'attach <session>')   Attach to running/completed session" >&2
-        echo "  $(gum style --foreground 82 'list')               List configured workflows" >&2
-        echo "  $(gum style --foreground 82 'history')            Show revision history" >&2
-        echo "  $(gum style --foreground 82 'help')               Show this help message" >&2
+        gum style --foreground 39 "  Core Workflow" >&2
+        echo "    $(gum style --foreground 82 'run <round>')        Run a revision round" >&2
+        echo "    $(gum style --foreground 82 'setup')              Interactive workflow setup wizard" >&2
+        echo "    $(gum style --foreground 82 'status')             Check Oracle session status" >&2
+        echo "    $(gum style --foreground 82 'attach <session>')   Attach to running/completed session" >&2
+        echo "" >&2
+        gum style --foreground 39 "  Management" >&2
+        echo "    $(gum style --foreground 82 'list')               List configured workflows" >&2
+        echo "    $(gum style --foreground 82 'history')            Show revision history" >&2
+        echo "    $(gum style --foreground 82 'update')             Check for and install updates" >&2
+        echo "    $(gum style --foreground 82 'help')               Show this help message" >&2
         echo "" >&2
 
         gum style --foreground 214 --bold "OPTIONS" >&2
@@ -900,7 +1168,16 @@ show_help() {
         gum style --faint "  --wait               Wait for completion (blocking)" >&2
         gum style --faint "  --login              Manual login mode (first-time setup)" >&2
         gum style --faint "  --keep-browser       Keep browser open after completion" >&2
+        gum style --faint "  -q, --quiet          Minimal output (errors only)" >&2
         gum style --faint "  --version            Show version" >&2
+        echo "" >&2
+
+        gum style --foreground 214 --bold "ENVIRONMENT VARIABLES" >&2
+        gum style --faint "  APR_HOME             Data directory (~/.local/share/apr)" >&2
+        gum style --faint "  APR_CACHE            Cache directory (~/.cache/apr)" >&2
+        gum style --faint "  APR_CHECK_UPDATES    Enable daily update checking (set to 1)" >&2
+        gum style --faint "  APR_NO_GUM           Disable gum even if available" >&2
+        gum style --faint "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
 
         gum style --foreground 214 --bold "EXAMPLES" >&2
@@ -918,18 +1195,39 @@ show_help() {
         echo "" >&2
         gum style --foreground 39 "  # Check session status" >&2
         echo "  apr status" >&2
+        echo "" >&2
+
+        gum style --foreground 214 --bold "EXIT CODES" >&2
+        gum style --faint "  0   Success" >&2
+        gum style --faint "  1   Partial failure" >&2
+        gum style --faint "  2   Usage error (bad arguments)" >&2
+        gum style --faint "  3   Dependency error (missing Oracle)" >&2
+        gum style --faint "  4   Configuration error" >&2
+        gum style --faint "  10  Network error" >&2
+        gum style --faint "  11  Update error" >&2
+        echo "" >&2
+
+        gum style --foreground 39 "More info: https://github.com/${REPO_OWNER}/${REPO_NAME}" >&2
     else
+        echo -e "${BOLD}${YELLOW}DESCRIPTION${NC}" >&2
+        echo "  Automated Plan Reviser Pro automates iterative specification" >&2
+        echo "  refinement using GPT Pro Extended Reasoning via Oracle." >&2
+        echo "" >&2
         echo -e "${BOLD}${YELLOW}SYNOPSIS${NC}" >&2
         echo "  apr [command] [options]" >&2
         echo "" >&2
         echo -e "${BOLD}${YELLOW}COMMANDS${NC}" >&2
-        echo -e "  ${GREEN}run <round>${NC}        Run a revision round" >&2
-        echo -e "  ${GREEN}setup${NC}              Interactive workflow setup wizard" >&2
-        echo -e "  ${GREEN}status${NC}             Check Oracle session status" >&2
-        echo -e "  ${GREEN}attach <session>${NC}   Attach to running/completed session" >&2
-        echo -e "  ${GREEN}list${NC}               List configured workflows" >&2
-        echo -e "  ${GREEN}history${NC}            Show revision history" >&2
-        echo -e "  ${GREEN}help${NC}               Show this help message" >&2
+        echo -e "  ${CYAN}Core Workflow${NC}" >&2
+        echo -e "    ${GREEN}run <round>${NC}        Run a revision round" >&2
+        echo -e "    ${GREEN}setup${NC}              Interactive workflow setup wizard" >&2
+        echo -e "    ${GREEN}status${NC}             Check Oracle session status" >&2
+        echo -e "    ${GREEN}attach <session>${NC}   Attach to running/completed session" >&2
+        echo "" >&2
+        echo -e "  ${CYAN}Management${NC}" >&2
+        echo -e "    ${GREEN}list${NC}               List configured workflows" >&2
+        echo -e "    ${GREEN}history${NC}            Show revision history" >&2
+        echo -e "    ${GREEN}update${NC}             Check for and install updates" >&2
+        echo -e "    ${GREEN}help${NC}               Show this help message" >&2
         echo "" >&2
         echo -e "${BOLD}${YELLOW}OPTIONS${NC}" >&2
         echo "  -w, --workflow NAME  Workflow to use (default: from config)" >&2
@@ -940,7 +1238,15 @@ show_help() {
         echo "  --wait               Wait for completion (blocking)" >&2
         echo "  --login              Manual login mode (first-time setup)" >&2
         echo "  --keep-browser       Keep browser open after completion" >&2
+        echo "  -q, --quiet          Minimal output (errors only)" >&2
         echo "  --version            Show version" >&2
+        echo "" >&2
+        echo -e "${BOLD}${YELLOW}ENVIRONMENT VARIABLES${NC}" >&2
+        echo "  APR_HOME             Data directory (~/.local/share/apr)" >&2
+        echo "  APR_CACHE            Cache directory (~/.cache/apr)" >&2
+        echo "  APR_CHECK_UPDATES    Enable daily update checking (set to 1)" >&2
+        echo "  APR_NO_GUM           Disable gum even if available" >&2
+        echo "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
         echo -e "${BOLD}${YELLOW}EXAMPLES${NC}" >&2
         echo "  apr setup                    # First-time setup" >&2
@@ -948,6 +1254,17 @@ show_help() {
         echo "  apr run 2 --include-impl     # Include implementation doc" >&2
         echo "  apr run 1 --login --wait     # First run with manual login" >&2
         echo "  apr status                   # Check session status" >&2
+        echo "" >&2
+        echo -e "${BOLD}${YELLOW}EXIT CODES${NC}" >&2
+        echo "  0   Success" >&2
+        echo "  1   Partial failure" >&2
+        echo "  2   Usage error (bad arguments)" >&2
+        echo "  3   Dependency error (missing Oracle)" >&2
+        echo "  4   Configuration error" >&2
+        echo "  10  Network error" >&2
+        echo "  11  Update error" >&2
+        echo "" >&2
+        echo -e "${CYAN}More info: https://github.com/${REPO_OWNER}/${REPO_NAME}${NC}" >&2
     fi
 }
 
@@ -968,19 +1285,32 @@ main() {
         exit $EXIT_SUCCESS
     fi
 
+    # Check for quiet flag early
+    for arg in "$@"; do
+        if [[ "$arg" == "-q" || "$arg" == "--quiet" ]]; then
+            QUIET_MODE=true
+            break
+        fi
+    done
+
     # Initialize gum
     check_gum || true
 
-    # Check Oracle availability
-    if ! check_oracle; then
-        print_error "Oracle not found"
-        print_info "Install with: npm install -g @steipete/oracle"
-        print_info "Or ensure npx is available"
-        exit $EXIT_DEPENDENCY_ERROR
+    # Check for updates (opt-in, non-blocking)
+    check_for_updates
+
+    # Check Oracle availability (not needed for some commands)
+    local command="${1:-help}"
+    if [[ "$command" != "help" && "$command" != "update" && "$command" != "--help" && "$command" != "-h" ]]; then
+        if ! check_oracle; then
+            print_error "Oracle not found"
+            print_info "Install with: npm install -g @steipete/oracle"
+            print_info "Or ensure npx is available"
+            exit $EXIT_DEPENDENCY_ERROR
+        fi
     fi
 
     # Parse command and options
-    local command="${1:-help}"
     shift || true
 
     # Global options
@@ -1027,6 +1357,10 @@ main() {
                 ;;
             --keep-browser)
                 KEEP_BROWSER=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET_MODE=true
                 shift
                 ;;
             --version)
@@ -1084,6 +1418,9 @@ main() {
             ;;
         history)
             show_history
+            ;;
+        update)
+            cmd_update
             ;;
         help|--help|-h)
             show_help

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # APR (Automated Plan Reviser Pro) Installer
-# Downloads and installs APR to your system
+# Downloads and installs APR to your system with checksum verification
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/automated_plan_reviser_pro/main/install.sh | bash
@@ -11,44 +11,150 @@
 #   APR_SYSTEM=1           Install to /usr/local/bin (requires sudo)
 #   APR_NO_DEPS=1          Skip dependency installation
 #   APR_VERSION=x.y.z      Install specific version (default: latest from main)
+#   APR_SKIP_VERIFY=1      Skip checksum verification (not recommended)
+#   NO_COLOR=1             Disable colored output
 #
+# Exit Codes:
+#   0   Success
+#   1   General error
+#   2   Download failed
+#   3   Checksum verification failed
+#   4   Installation failed
 
 set -euo pipefail
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# Exit codes (documented for consistency with apr)
+# shellcheck disable=SC2034  # Documented for reference
+readonly EXIT_SUCCESS=0
+readonly EXIT_ERROR=1
+readonly EXIT_DOWNLOAD_ERROR=2
+readonly EXIT_CHECKSUM_ERROR=3
+readonly EXIT_INSTALL_ERROR=4
 
 # Configuration
-REPO_OWNER="Dicklesworthstone"
-REPO_NAME="automated_plan_reviser_pro"
-REPO_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main"
-SCRIPT_NAME="apr"
+readonly REPO_OWNER="Dicklesworthstone"
+readonly REPO_NAME="automated_plan_reviser_pro"
+readonly REPO_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main"
+readonly RELEASES_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
+readonly SCRIPT_NAME="apr"
+readonly INSTALLER_VERSION="1.1.0"
 
+# Colors (conditional on TTY and NO_COLOR)
+if [[ -t 2 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    MAGENTA='\033[0;35m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' BOLD='' DIM='' NC=''
+fi
+
+# Logging functions (all output to stderr)
 log_info() { echo -e "${GREEN}[apr]${NC} $1" >&2; }
 log_warn() { echo -e "${YELLOW}[apr]${NC} $1" >&2; }
 log_error() { echo -e "${RED}[apr]${NC} $1" >&2; }
 log_step() { echo -e "${BLUE}[apr]${NC} $1" >&2; }
+log_dim() { echo -e "${DIM}$1${NC}" >&2; }
 
+# Download a file with retry and progress
 download_file() {
     local url="$1"
     local out="$2"
+    local max_retries=3
+    local retry_delay=2
+    local attempt=1
 
+    while (( attempt <= max_retries )); do
+        if command -v curl &> /dev/null; then
+            if curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$out" 2>/dev/null; then
+                return 0
+            fi
+        elif command -v wget &> /dev/null; then
+            if wget -q --timeout=60 -O "$out" "$url" 2>/dev/null; then
+                return 0
+            fi
+        else
+            log_error "Neither curl nor wget found. Please install one of them."
+            return 127
+        fi
+
+        if (( attempt < max_retries )); then
+            log_warn "Download attempt $attempt failed, retrying in ${retry_delay}s..."
+            sleep "$retry_delay"
+            retry_delay=$((retry_delay * 2))
+        fi
+        ((attempt++))
+    done
+
+    return 1
+}
+
+# Fetch a URL and return content to stdout
+fetch_url() {
+    local url="$1"
     if command -v curl &> /dev/null; then
-        curl -fsSL "$url" -o "$out" || return 1
+        curl -fsSL --connect-timeout 5 --max-time 30 "$url" 2>/dev/null
     elif command -v wget &> /dev/null; then
-        wget -qO "$out" "$url" || return 1
+        wget -q --timeout=30 -O - "$url" 2>/dev/null
     else
-        log_error "Neither curl nor wget found. Please install one of them."
-        return 127
+        return 1
     fi
+}
+
+# Verify checksum of a file
+verify_checksum() {
+    local file="$1"
+    local expected="$2"
+
+    if [[ -z "$expected" ]]; then
+        return 0  # No checksum to verify
+    fi
+
+    local actual=""
+    if command -v sha256sum &> /dev/null; then
+        actual=$(sha256sum "$file" | cut -d' ' -f1)
+    elif command -v shasum &> /dev/null; then
+        actual=$(shasum -a 256 "$file" | cut -d' ' -f1)
+    else
+        log_warn "No sha256sum or shasum available, skipping verification"
+        return 0
+    fi
+
+    if [[ "$actual" == "$expected" ]]; then
+        return 0
+    else
+        log_error "Checksum mismatch!"
+        log_error "  Expected: $expected"
+        log_error "  Got:      $actual"
+        return 1
+    fi
+}
+
+# Verify downloaded file is a valid bash script
+verify_script() {
+    local file="$1"
+    local first_line=""
+
+    IFS= read -r first_line < "$file" 2>/dev/null || true
+
+    if [[ "$first_line" != "#!/usr/bin/env bash" ]]; then
+        log_error "Downloaded file is not a valid bash script"
+        log_error "First line: $first_line"
+        return 1
+    fi
+
+    # Basic syntax check
+    if ! bash -n "$file" 2>/dev/null; then
+        log_error "Downloaded script has syntax errors"
+        return 1
+    fi
+
+    return 0
 }
 
 get_install_dir() {
@@ -211,13 +317,34 @@ install_oracle() {
     return 1
 }
 
+# Self-refresh: re-download installer if stale (cache-busting)
+check_installer_update() {
+    # Only check if we have network and this is a fresh install
+    if [[ -n "${APR_SKIP_INSTALLER_CHECK:-}" ]]; then
+        return 0
+    fi
+
+    local remote_version=""
+    remote_version=$(fetch_url "${REPO_URL}/install.sh" 2>/dev/null | grep -m1 '^readonly INSTALLER_VERSION=' | cut -d'"' -f2) || true
+
+    if [[ -n "$remote_version" && "$remote_version" != "$INSTALLER_VERSION" ]]; then
+        log_warn "Newer installer available ($INSTALLER_VERSION -> $remote_version)"
+        log_dim "  Re-run: curl -fsSL ${REPO_URL}/install.sh | bash"
+    fi
+}
+
 main() {
     echo "" >&2
-    echo -e "${BOLD}${MAGENTA}╔════════════════════════════════════════════════════════════════╗${NC}" >&2
-    echo -e "${BOLD}${MAGENTA}║${NC}  ${BOLD}  Automated Plan Reviser Pro${NC}                                ${BOLD}${MAGENTA}║${NC}" >&2
-    echo -e "${BOLD}${MAGENTA}║${NC}  ${DIM}Iterative AI-Powered Spec Refinement${NC}                         ${BOLD}${MAGENTA}║${NC}" >&2
-    echo -e "${BOLD}${MAGENTA}╚════════════════════════════════════════════════════════════════╝${NC}" >&2
+    echo -e "${BOLD}${MAGENTA}+================================================================+${NC}" >&2
+    echo -e "${BOLD}${MAGENTA}|${NC}  ${BOLD}  Automated Plan Reviser Pro${NC}                                ${BOLD}${MAGENTA}|${NC}" >&2
+    echo -e "${BOLD}${MAGENTA}|${NC}  ${DIM}Iterative AI-Powered Spec Refinement${NC}                         ${BOLD}${MAGENTA}|${NC}" >&2
+    echo -e "${BOLD}${MAGENTA}+================================================================+${NC}" >&2
     echo "" >&2
+    log_dim "Installer version: $INSTALLER_VERSION"
+    echo "" >&2
+
+    # Check for installer updates (non-blocking)
+    check_installer_update
 
     local install_dir shell_config
     install_dir=$(get_install_dir)
@@ -241,18 +368,58 @@ main() {
             log_warn "Using sudo for installation to ${install_dir}"
         else
             log_error "Cannot write to ${install_dir} and sudo not available"
-            exit 1
+            exit $EXIT_ERROR
         fi
     fi
 
+    # Determine download URL
+    local download_url checksum_url version_info=""
+    if [[ -n "${APR_VERSION:-}" ]]; then
+        # Specific version from releases
+        download_url="${RELEASES_URL}/download/v${APR_VERSION}/apr"
+        checksum_url="${RELEASES_URL}/download/v${APR_VERSION}/apr.sha256"
+        version_info="v${APR_VERSION}"
+    else
+        # Latest from main branch
+        download_url="${REPO_URL}/${SCRIPT_NAME}"
+        checksum_url="${REPO_URL}/apr.sha256"
+        version_info="latest"
+    fi
+
     # Download APR
-    log_step "Downloading APR..."
+    log_step "Downloading APR (${version_info})..."
     local tmp_file
     tmp_file=$(mktemp)
-    if ! download_file "${REPO_URL}/${SCRIPT_NAME}" "$tmp_file"; then
-        log_error "Failed to download APR"
+    if ! download_file "$download_url" "$tmp_file"; then
+        log_error "Failed to download APR from: $download_url"
         rm -f "$tmp_file"
-        exit 1
+        exit $EXIT_DOWNLOAD_ERROR
+    fi
+
+    # Verify it's a valid script
+    log_step "Verifying script..."
+    if ! verify_script "$tmp_file"; then
+        rm -f "$tmp_file"
+        exit $EXIT_CHECKSUM_ERROR
+    fi
+
+    # Checksum verification (if available and not skipped)
+    if [[ -z "${APR_SKIP_VERIFY:-}" ]]; then
+        local expected_checksum=""
+        expected_checksum=$(fetch_url "$checksum_url" 2>/dev/null | tr -d '[:space:]') || true
+
+        if [[ -n "$expected_checksum" ]]; then
+            log_step "Verifying checksum..."
+            if ! verify_checksum "$tmp_file" "$expected_checksum"; then
+                rm -f "$tmp_file"
+                exit $EXIT_CHECKSUM_ERROR
+            fi
+            log_info "Checksum verified"
+        else
+            log_dim "  (checksum not available for verification)"
+        fi
+    else
+        log_warn "Skipping checksum verification (APR_SKIP_VERIFY=1)"
     fi
 
     # Install APR
@@ -273,8 +440,12 @@ main() {
 
     # Verify installation
     if [[ -x "$script_path" ]]; then
+        # Get installed version
+        local installed_version=""
+        installed_version=$("$script_path" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
+
         echo "" >&2
-        log_info "Installation complete!"
+        log_info "Installation complete! ${installed_version:+(v$installed_version)}"
         echo "" >&2
         echo -e "${BOLD}What APR Does:${NC}" >&2
         echo -e "  ${GREEN}1.${NC} Bundle your docs (README, spec, implementation)" >&2
@@ -303,7 +474,7 @@ main() {
         echo "" >&2
     else
         log_error "Installation failed - script not executable"
-        exit 1
+        exit $EXIT_INSTALL_ERROR
     fi
 }
 

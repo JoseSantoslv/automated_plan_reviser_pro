@@ -324,4 +324,5 @@ When modifying APR:
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.1.0 | 2026-01-12 | Self-update, NO_COLOR support, checksum verification, GitHub Actions CI/release |
 | 1.0.0 | 2026-01-12 | Initial release |
