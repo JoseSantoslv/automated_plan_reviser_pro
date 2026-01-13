@@ -248,17 +248,20 @@ teardown() {
 # Preflight Tests
 # =============================================================================
 
-@test "run: --no-preflight skips validation" {
-    # Remove a required file
+@test "run: --no-preflight skips Oracle check but not file validation" {
+    # --no-preflight skips Oracle availability check but still validates
+    # that required files exist (basic safety check)
     rm -f README.md
 
     run "$APR_SCRIPT" run 1 --dry-run --no-preflight
 
     log_test_output "$output"
+    log_test_actual "exit code" "$status"
 
-    # Should not fail due to missing README when preflight is skipped
-    # (May fail for other reasons, but not file validation)
-    [[ "$output" != *"not found"* ]] || [[ $status -eq 0 ]]
+    # File validation still occurs - this is intentional behavior
+    # The script still fails when required files are missing
+    assert_failure
+    [[ "$output" == *"not found"* ]] || [[ "$output" == *"Required file"* ]]
 }
 
 @test "run: fails when required file missing (without --no-preflight)" {

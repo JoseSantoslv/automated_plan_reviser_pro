@@ -331,8 +331,11 @@ install_node() {
                 if command -v curl &> /dev/null; then
                     curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - &>/dev/null
                     sudo apt-get install -y -qq nodejs &>/dev/null && return 0
+                elif command -v wget &> /dev/null; then
+                    wget -qO- https://deb.nodesource.com/setup_18.x | sudo -E bash - &>/dev/null
+                    sudo apt-get install -y -qq nodejs &>/dev/null && return 0
                 else
-                    log_warn "curl not available; cannot install Node.js via NodeSource"
+                    log_warn "curl/wget not available; cannot install Node.js via NodeSource"
                     return 1
                 fi
             elif command -v dnf &> /dev/null; then
