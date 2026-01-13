@@ -1633,128 +1633,6 @@ collect_round_document_metrics() {
         }'
 }
 
-calculate_change_metrics() {
-    local old_file="$1"
-    local new_file="$2"
-
-    if ! command -v jq &>/dev/null; then
-        print_error "jq is required for analytics metrics"
-        return 1
-    fi
-
-    verbose "Calculating change metrics"
-    verbose "  Old: $old_file"
-    verbose "  New: $new_file"
-
-    if [[ ! -f "$old_file" ]]; then
-        verbose "Old file not found, returning null"
-        echo "null"
-        return 0
-    fi
-
-    if [[ ! -f "$new_file" ]]; then
-        verbose "New file not found, returning null"
-        echo "null"
-        return 0
-    fi
-
-    local start_ts end_ts elapsed_ms
-    start_ts=$(date +%s 2>/dev/null || echo 0)
-
-    if cmp -s "$old_file" "$new_file"; then
-        verbose "Files are identical (fast path)"
-        end_ts=$(date +%s 2>/dev/null || echo 0)
-        elapsed_ms=$(( (end_ts - start_ts) * 1000 ))
-        verbose "calculate_change_metrics completed in ${elapsed_ms}ms"
-        jq -nc '{
-            lines_added: 0,
-            lines_deleted: 0,
-            lines_modified: 0,
-            total_changes: 0,
-            diff_ratio: 0,
-            similarity_score: 1.0,
-            identical: true
-        }'
-        return 0
-    fi
-
-    verbose "Files differ, computing metrics..."
-
-    local diff_output lines_added lines_deleted total_changes
-    local total_lines diff_ratio similarity_score
-
-    diff_output=$(diff "$old_file" "$new_file" 2>/dev/null || true)
-    lines_added=$(echo "$diff_output" | grep -c '^>' 2>/dev/null || echo 0)
-    lines_deleted=$(echo "$diff_output" | grep -c '^<' 2>/dev/null || echo 0)
-    total_changes=$((lines_added + lines_deleted))
-
-    verbose "Diff counts: +$lines_added -$lines_deleted (total: $total_changes)"
-
-    total_lines=$(wc -l < "$new_file" | tr -d ' ')
-    diff_ratio=$(awk -v changes="$total_changes" -v total="$total_lines" \
-        'BEGIN { if (total > 0) printf "%.4f", changes / total; else printf "0" }')
-
-    verbose "Diff ratio: $diff_ratio ($total_changes / $total_lines)"
-
-    local common_lines total_unique
-    common_lines=$(comm -12 <(sort "$old_file") <(sort "$new_file") 2>/dev/null | wc -l | tr -d ' ')
-    total_unique=$(cat <(sort -u "$old_file") <(sort -u "$new_file") 2>/dev/null | sort -u | wc -l | tr -d ' ')
-
-    similarity_score=$(awk -v common="$common_lines" -v total="$total_unique" \
-        'BEGIN { if (total > 0) printf "%.4f", common / total; else printf "1.0" }')
-
-    verbose "Similarity: $similarity_score ($common_lines common / $total_unique unique)"
-
-    end_ts=$(date +%s 2>/dev/null || echo 0)
-    elapsed_ms=$(( (end_ts - start_ts) * 1000 ))
-    verbose "calculate_change_metrics completed in ${elapsed_ms}ms"
-
-    jq -nc \
-        --argjson lines_added "$lines_added" \
-        --argjson lines_deleted "$lines_deleted" \
-        --argjson total_changes "$total_changes" \
-        --argjson diff_ratio "$diff_ratio" \
-        --argjson similarity_score "$similarity_score" \
-        '{
-            lines_added: $lines_added,
-            lines_deleted: $lines_deleted,
-            lines_modified: 0,
-            total_changes: $total_changes,
-            diff_ratio: $diff_ratio,
-            similarity_score: $similarity_score,
-            identical: false
-        }'
-}
-
-calculate_round_changes() {
-    local workflow="$1"
-    local current_round="$2"
-
-    if ! command -v jq &>/dev/null; then
-        print_error "jq is required for analytics metrics"
-        return 1
-    fi
-
-    local prev_round=$((current_round - 1))
-
-    verbose "Calculating round changes: round $current_round vs round $prev_round"
-
-    if [[ $prev_round -lt 1 ]]; then
-        verbose "No previous round (current is round 1), returning null"
-        echo "null"
-        return 0
-    fi
-
-    local prev_output="$CONFIG_DIR/rounds/$workflow/round_${prev_round}.md"
-    local curr_output="$CONFIG_DIR/rounds/$workflow/round_${current_round}.md"
-
-    verbose "Comparing outputs:"
-    verbose "  Previous: $prev_output"
-    verbose "  Current:  $curr_output"
-
-    calculate_change_metrics "$prev_output" "$curr_output"
-}
-
 # ---------------------------------------------------------------------------
 # Inter-Round Change Analysis (fzi.4)
 # ---------------------------------------------------------------------------
@@ -1811,8 +1689,8 @@ calculate_change_metrics() {
     diff_output=$(diff "$old_file" "$new_file" 2>/dev/null || true)
 
     # Count changes
-    lines_added=$(echo "$diff_output" | grep -c '^>' 2>/dev/null || echo 0)
-    lines_deleted=$(echo "$diff_output" | grep -c '^<' 2>/dev/null || echo 0)
+    lines_added=$(echo "$diff_output" | grep -c '^>' 2>/dev/null || true)
+    lines_deleted=$(echo "$diff_output" | grep -c '^<' 2>/dev/null || true)
     total_changes=$((lines_added + lines_deleted))
 
     verbose "Diff counts: +$lines_added -$lines_deleted (total: $total_changes)"
@@ -1865,6 +1743,7 @@ calculate_change_metrics() {
 calculate_round_changes() {
     local workflow="$1"
     local current_round="$2"
+    local output_dir="${3:-}"
 
     local prev_round=$((current_round - 1))
 
@@ -1880,14 +1759,246 @@ calculate_round_changes() {
     # Compare OUTPUT files (GPT responses), not spec files
     # The spec changes are made by the USER after each round
     # We track GPT output changes to detect convergence
-    local prev_output="$CONFIG_DIR/rounds/$workflow/round_${prev_round}.md"
-    local curr_output="$CONFIG_DIR/rounds/$workflow/round_${current_round}.md"
+    if [[ -z "$output_dir" ]]; then
+        output_dir="$CONFIG_DIR/rounds/$workflow"
+    fi
+
+    local prev_output="$output_dir/round_${prev_round}.md"
+    local curr_output="$output_dir/round_${current_round}.md"
 
     verbose "Comparing outputs:"
     verbose "  Previous: $prev_output"
     verbose "  Current:  $curr_output"
 
     calculate_change_metrics "$prev_output" "$curr_output"
+}
+
+# -----------------------------------------------------------------------------
+# Convergence Detection (fzi.5)
+# -----------------------------------------------------------------------------
+
+calculate_output_trend_signal() {
+    local metrics_json="$1"
+
+    verbose "Calculating output size trend signal"
+
+    local sizes=()
+    mapfile -t sizes < <(echo "$metrics_json" | jq -r '.rounds[-5:][].output.char_count // 0' 2>/dev/null || true)
+
+    local count=${#sizes[@]}
+    if [[ $count -lt 2 ]]; then
+        echo "0"
+        return 0
+    fi
+
+    local half=$((count / 2))
+    [[ $half -lt 1 ]] && half=1
+    local first_sum=0 second_sum=0
+    local i
+    for i in "${!sizes[@]}"; do
+        if [[ $i -lt $half ]]; then
+            first_sum=$((first_sum + sizes[i]))
+        else
+            second_sum=$((second_sum + sizes[i]))
+        fi
+    done
+
+    local second_count=$((count - half))
+    [[ $second_count -lt 1 ]] && second_count=1
+
+    local first_avg second_avg
+    first_avg=$(echo "scale=4; $first_sum / $half" | bc 2>/dev/null || echo "0")
+    second_avg=$(echo "scale=4; $second_sum / $second_count" | bc 2>/dev/null || echo "0")
+
+    verbose "Output size averages: first=$first_avg second=$second_avg"
+
+    if [[ $(echo "$first_avg == 0" | bc 2>/dev/null || echo 1) -eq 1 ]]; then
+        echo "0"
+        return 0
+    fi
+
+    local low high signal
+    low=$(echo "scale=4; $first_avg * 0.8" | bc 2>/dev/null || echo "0")
+    high=$(echo "scale=4; $first_avg * 1.2" | bc 2>/dev/null || echo "0")
+
+    if [[ $(echo "$second_avg <= $low" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+        signal="1.0"
+    elif [[ $(echo "$second_avg >= $high" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+        signal="0.0"
+    else
+        signal=$(echo "scale=4; 1 - (($second_avg - $low) / ($high - $low))" | bc 2>/dev/null || echo "0")
+    fi
+
+    echo "$signal"
+}
+
+calculate_change_velocity_signal() {
+    local metrics_json="$1"
+
+    verbose "Calculating change velocity signal"
+
+    local ratios=()
+    mapfile -t ratios < <(echo "$metrics_json" | jq -r '.rounds[-5:][].changes_from_previous.diff_ratio // 1.0' 2>/dev/null || true)
+
+    local count=${#ratios[@]}
+    if [[ $count -lt 1 ]]; then
+        echo "0"
+        return 0
+    fi
+
+    local sum=0
+    local r
+    for r in "${ratios[@]}"; do
+        sum=$(echo "scale=4; $sum + $r" | bc 2>/dev/null || echo "$sum")
+    done
+
+    local avg
+    avg=$(echo "scale=4; $sum / $count" | bc 2>/dev/null || echo "1.0")
+    verbose "Average diff ratio: $avg"
+
+    local signal
+    if [[ $(echo "$avg <= 0.1" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+        signal="1.0"
+    elif [[ $(echo "$avg >= 0.5" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+        signal="0.0"
+    else
+        signal=$(echo "scale=4; 1 - (($avg - 0.1) / 0.4)" | bc 2>/dev/null || echo "0")
+    fi
+
+    echo "$signal"
+}
+
+calculate_similarity_trend_signal() {
+    local metrics_json="$1"
+
+    verbose "Calculating similarity trend signal"
+
+    local sims=()
+    mapfile -t sims < <(echo "$metrics_json" | jq -r '.rounds[-5:][].changes_from_previous.similarity_score // 0' 2>/dev/null || true)
+
+    local count=${#sims[@]}
+    if [[ $count -lt 1 ]]; then
+        echo "0"
+        return 0
+    fi
+
+    local sum=0
+    local s
+    for s in "${sims[@]}"; do
+        sum=$(echo "scale=4; $sum + $s" | bc 2>/dev/null || echo "$sum")
+    done
+
+    local avg
+    avg=$(echo "scale=4; $sum / $count" | bc 2>/dev/null || echo "0")
+    verbose "Average similarity score: $avg"
+
+    local signal
+    if [[ $(echo "$avg >= 0.9" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+        signal="1.0"
+    elif [[ $(echo "$avg <= 0.6" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+        signal="0.0"
+    else
+        signal=$(echo "scale=4; ($avg - 0.6) / 0.3" | bc 2>/dev/null || echo "0")
+    fi
+
+    echo "$signal"
+}
+
+calculate_convergence() {
+    local workflow="$1"
+
+    verbose "Calculating convergence for workflow: $workflow"
+
+    if ! command -v bc &>/dev/null; then
+        print_warning "bc not available; convergence disabled"
+        jq -nc '{
+            detected: false,
+            confidence: 0.0,
+            estimated_rounds_remaining: null,
+            signals: {
+                output_size_trend: 0.0,
+                change_velocity: 0.0,
+                similarity_trend: 0.0
+            }
+        }'
+        return 0
+    fi
+
+    local metrics_json
+    metrics_json=$(metrics_read "$workflow") || return 1
+
+    local round_count
+    round_count=$(echo "$metrics_json" | jq -r '.rounds | length' 2>/dev/null || echo "0")
+
+    if [[ "$round_count" -lt 3 ]]; then
+        verbose "Insufficient rounds for convergence analysis (need >= 3)"
+        jq -nc '{
+            detected: false,
+            confidence: 0.0,
+            estimated_rounds_remaining: null,
+            signals: {
+                output_size_trend: 0.0,
+                change_velocity: 0.0,
+                similarity_trend: 0.0
+            }
+        }'
+        return 0
+    fi
+
+    local output_signal change_signal similarity_signal
+    output_signal=$(calculate_output_trend_signal "$metrics_json")
+    change_signal=$(calculate_change_velocity_signal "$metrics_json")
+    similarity_signal=$(calculate_similarity_trend_signal "$metrics_json")
+
+    verbose "Signals: output=$output_signal change=$change_signal similarity=$similarity_signal"
+
+    local convergence_score
+    convergence_score=$(echo "scale=4; 0.35 * $output_signal + 0.35 * $change_signal + 0.30 * $similarity_signal" | bc 2>/dev/null || echo "0")
+
+    local detected="false"
+    local is_converged
+    is_converged=$(echo "$convergence_score >= 0.75" | bc 2>/dev/null || echo "0")
+    if [[ "$is_converged" -eq 1 ]]; then
+        detected="true"
+    fi
+
+    local estimated_remaining="null"
+    if [[ "$detected" != "true" ]]; then
+        estimated_remaining=$(echo "scale=0; (1 - $convergence_score) * 5 / 1" | bc 2>/dev/null || echo "1")
+        if [[ -z "$estimated_remaining" || "$estimated_remaining" -lt 1 ]]; then
+            estimated_remaining=1
+        fi
+    fi
+
+    jq -nc \
+        --argjson detected "$detected" \
+        --argjson confidence "$convergence_score" \
+        --argjson est_remaining "$estimated_remaining" \
+        --argjson output_signal "$output_signal" \
+        --argjson change_signal "$change_signal" \
+        --argjson similarity_signal "$similarity_signal" \
+        '{
+            detected: $detected,
+            confidence: $confidence,
+            estimated_rounds_remaining: $est_remaining,
+            signals: {
+                output_size_trend: $output_signal,
+                change_velocity: $change_signal,
+                similarity_trend: $similarity_signal
+            }
+        }'
+}
+
+update_convergence_metrics() {
+    local workflow="$1"
+
+    verbose "Updating convergence metrics for workflow: $workflow"
+
+    local convergence_data
+    convergence_data=$(calculate_convergence "$workflow") || return 1
+
+    metrics_write_convergence "$workflow" "$convergence_data"
+    verbose "Convergence metrics updated"
 }
 
 # -----------------------------------------------------------------------------
@@ -2366,7 +2477,7 @@ run_round() {
 
                     if [[ -n "${round_record:-}" ]]; then
                         local change_metrics
-                        change_metrics=$(calculate_round_changes "$workflow" "$round_num") || {
+                        change_metrics=$(calculate_round_changes "$workflow" "$round_num" "$output_dir") || {
                             print_warning "Failed to calculate change metrics"
                             change_metrics="null"
                         }
@@ -2382,6 +2493,24 @@ run_round() {
                             verbose "Metrics written for round $round_num"
                         else
                             print_warning "Failed to write round metrics"
+                        fi
+
+                        if update_convergence_metrics "$workflow"; then
+                            local confidence is_high
+                            if confidence=$(metrics_read "$workflow" | jq -r '.convergence.confidence // 0' 2>/dev/null); then
+                                if command -v bc &>/dev/null; then
+                                    is_high=$(echo "$confidence >= 0.75" | bc 2>/dev/null || echo "0")
+                                    if [[ "$is_high" -eq 1 ]]; then
+                                        print_success "Specification appears to be converging (confidence: $confidence)"
+                                    else
+                                        print_dim "Convergence confidence: $confidence"
+                                    fi
+                                fi
+                            else
+                                print_warning "Failed to read convergence metrics"
+                            fi
+                        else
+                            print_warning "Failed to update convergence metrics"
                         fi
                     fi
                 fi
@@ -2861,6 +2990,294 @@ EOF
 # Stats - Round analytics and convergence signals
 # -----------------------------------------------------------------------------
 
+format_bytes() {
+    local bytes="${1:-0}"
+    if [[ -z "$bytes" || "$bytes" == "null" ]]; then
+        echo "0B"
+        return 0
+    fi
+    if [[ ! "$bytes" =~ ^[0-9]+$ ]]; then
+        echo "0B"
+        return 0
+    fi
+
+    if [[ "$bytes" -ge 1048576 ]]; then
+        awk -v b="$bytes" 'BEGIN { printf "%.1fM", b/1048576 }'
+    elif [[ "$bytes" -ge 1024 ]]; then
+        awk -v b="$bytes" 'BEGIN { printf "%.1fK", b/1024 }'
+    else
+        echo "${bytes}B"
+    fi
+}
+
+safe_json_num() {
+    local json="$1"
+    local path="$2"
+    local default="${3:-0}"
+
+    local value
+    value=$(echo "$json" | jq -r "$path // $default" 2>/dev/null || echo "$default")
+    if [[ -z "$value" || "$value" == "null" ]]; then
+        echo "$default"
+    else
+        echo "$value"
+    fi
+}
+
+generate_sparkline() {
+    local values=("$@")
+    local count=${#values[@]}
+    [[ $count -eq 0 ]] && return 0
+
+    local min=${values[0]}
+    local max=${values[0]}
+    local v
+    for v in "${values[@]}"; do
+        (( v < min )) && min=$v
+        (( v > max )) && max=$v
+    done
+
+    local range=$((max - min))
+    [[ $range -eq 0 ]] && range=1
+
+    local chars="▁▂▃▄▅▆▇█"
+    local sparkline=""
+    for v in "${values[@]}"; do
+        local idx=$(( (v - min) * 7 / range ))
+        sparkline+="${chars:$idx:1}"
+    done
+
+    echo "$sparkline"
+}
+
+get_trend_arrow() {
+    local values=("$@")
+    local count=${#values[@]}
+    if [[ $count -lt 2 ]]; then
+        echo "→"
+        return 0
+    fi
+
+    local half=$((count / 2))
+    [[ $half -lt 1 ]] && half=1
+    local first_sum=0 second_sum=0 i
+    for ((i=0; i<half; i++)); do
+        first_sum=$((first_sum + values[i]))
+    done
+    for ((i=half; i<count; i++)); do
+        second_sum=$((second_sum + values[i]))
+    done
+
+    local first_avg=$((first_sum / half))
+    local second_count=$((count - half))
+    [[ $second_count -lt 1 ]] && second_count=1
+    local second_avg=$((second_sum / second_count))
+
+    if (( second_avg < first_avg * 80 / 100 )); then
+        echo "↘"
+    elif (( second_avg > first_avg * 120 / 100 )); then
+        echo "↗"
+    else
+        echo "→"
+    fi
+}
+
+get_convergence_indicator() {
+    local confidence="${1:-0}"
+    local indicator="◌"
+
+    if command -v bc &>/dev/null; then
+        if [[ $(echo "$confidence >= 0.90" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+            indicator="●"
+        elif [[ $(echo "$confidence >= 0.75" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+            indicator="◉"
+        elif [[ $(echo "$confidence >= 0.50" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+            indicator="○"
+        fi
+    fi
+
+    echo "$indicator"
+}
+
+format_changes() {
+    local added="${1:-}"
+    local deleted="${2:-}"
+
+    if [[ -z "$added" || "$added" == "null" ]]; then
+        echo "-"
+    else
+        echo "+${added}-${deleted}"
+    fi
+}
+
+show_stats_full() {
+    local workflow="$1"
+
+    if ! command -v jq &>/dev/null; then
+        print_warning "jq not available; falling back to basic stats"
+        return 1
+    fi
+
+    local metrics
+    metrics=$(metrics_read "$workflow") || return 1
+
+    local round_count
+    round_count=$(echo "$metrics" | jq -r '.rounds | length' 2>/dev/null || echo "0")
+    verbose "show_stats_full: rounds=$round_count"
+
+    if [[ "$round_count" -lt 1 ]]; then
+        print_warning "No rounds recorded yet for workflow '$workflow'"
+        print_info "Run 'apr run 1' to start your first revision round"
+        return 0
+    fi
+
+    local has_backfilled
+    has_backfilled=$(echo "$metrics" | jq -r 'any(.rounds[]?; .backfilled == true) // false' 2>/dev/null || echo "false")
+
+    local average_size
+    average_size=$(echo "$metrics" | jq -r '[.rounds[].output.char_count // 0] | add / length' 2>/dev/null || echo "0")
+    average_size=${average_size%.*}
+    if [[ ! "$average_size" =~ ^[0-9]+$ ]]; then
+        average_size=0
+    fi
+    local avg_human
+    avg_human=$(format_bytes "$average_size")
+
+    local confidence
+    confidence=$(echo "$metrics" | jq -r '.convergence.confidence // 0' 2>/dev/null || echo "0")
+    verbose "show_stats_full: avg_size=$average_size confidence=$confidence"
+    local indicator
+    indicator=$(get_convergence_indicator "$confidence")
+
+    local estimated_remaining
+    estimated_remaining=$(echo "$metrics" | jq -r '.convergence.estimated_rounds_remaining // ""' 2>/dev/null || echo "")
+
+    print_banner
+    print_header "REVISION STATISTICS: $workflow"
+    echo "" >&2
+    if [[ "$has_backfilled" == "true" ]]; then
+        print_dim "Note: Some metrics were backfilled and may be less precise"
+        echo "" >&2
+    fi
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style \
+            --border rounded \
+            --border-foreground 212 \
+            --padding "1 2" \
+            "Rounds: ${round_count}    Avg Size: ${avg_human}    Status: ${indicator}" \
+            "Convergence: $(printf "%.0f" "$(echo "$confidence * 100" | bc 2>/dev/null || echo 0)")% confidence" \
+            "Estimated remaining: ${estimated_remaining:-N/A} rounds" >&2
+    else
+        echo "┌────────────────────────────────────────────────────────────┐" >&2
+        printf "│  Rounds: %-4s Avg Size: %-6s Status: %-2s              │\n" "$round_count" "$avg_human" "$indicator" >&2
+        printf "│  Convergence: %-5s confidence                           │\n" "$(printf "%.0f%%" "$(echo "$confidence * 100" | bc 2>/dev/null || echo 0)")" >&2
+        printf "│  Estimated remaining: %-5s rounds                      │\n" "${estimated_remaining:-N/A}" >&2
+        echo "└────────────────────────────────────────────────────────────┘" >&2
+    fi
+
+    echo "" >&2
+
+    local output_sizes=()
+    mapfile -t output_sizes < <(echo "$metrics" | jq -r '.rounds | sort_by(.round) | .[].output.char_count // 0')
+    local change_values=()
+    mapfile -t change_values < <(echo "$metrics" | jq -r '.rounds | sort_by(.round) | map((.changes_from_previous.diff_ratio // 0) * 100 | floor) | .[]')
+    local similarity_values=()
+    mapfile -t similarity_values < <(echo "$metrics" | jq -r '.rounds | sort_by(.round) | map((.changes_from_previous.similarity_score // 0) * 100 | floor) | .[]')
+
+    if [[ ${#output_sizes[@]} -ge 3 ]]; then
+        verbose "show_stats_full: rendering sparklines"
+        local output_spark change_spark similarity_spark
+        output_spark=$(generate_sparkline "${output_sizes[@]}")
+        change_spark=$(generate_sparkline "${change_values[@]}")
+        similarity_spark=$(generate_sparkline "${similarity_values[@]}")
+
+        echo "TREND SPARKLINES" >&2
+        printf "  Output Size:  %s %s\n" "$output_spark" "$(get_trend_arrow "${output_sizes[@]}")" >&2
+        printf "  Changes:      %s %s\n" "$change_spark" "$(get_trend_arrow "${change_values[@]}")" >&2
+        printf "  Similarity:   %s %s\n" "$similarity_spark" "$(get_trend_arrow "${similarity_values[@]}")" >&2
+        echo "" >&2
+    fi
+
+    echo "ROUND DETAILS" >&2
+    verbose "show_stats_full: rendering round table"
+    printf "  %-3s │ %-7s │ %-9s │ %-7s │ %-10s\n" "#" "Output" "Changes" "Similar" "Modified" >&2
+    echo "  ───┼─────────┼───────────┼─────────┼────────────" >&2
+
+    local round_json
+    while IFS= read -r round_json; do
+        local round_num output_size added deleted similarity ts date_only
+        round_num=$(safe_json_num "$round_json" '.round' "0")
+        output_size=$(safe_json_num "$round_json" '.output.char_count' "0")
+        added=$(safe_json_num "$round_json" '.changes_from_previous.lines_added' "null")
+        deleted=$(safe_json_num "$round_json" '.changes_from_previous.lines_deleted' "null")
+        similarity=$(safe_json_num "$round_json" '.changes_from_previous.similarity_score' "null")
+        ts=$(echo "$round_json" | jq -r '.timestamp // ""' 2>/dev/null || echo "")
+        date_only=${ts%%T*}
+        [[ -z "$date_only" || "$date_only" == "null" ]] && date_only="N/A"
+
+        printf "  %-3s │ %-7s │ %-9s │ %-7s │ %-10s\n" \
+            "$round_num" \
+            "$(format_bytes "$output_size")" \
+            "$(format_changes "$added" "$deleted")" \
+            "${similarity:-"-"}" \
+            "$date_only" >&2
+    done < <(echo "$metrics" | jq -c '.rounds | sort_by(.round) | .[]')
+
+    echo "" >&2
+
+    local output_signal change_signal similarity_signal
+    output_signal=$(safe_json_num "$metrics" '.convergence.signals.output_size_trend' "0")
+    change_signal=$(safe_json_num "$metrics" '.convergence.signals.change_velocity' "0")
+    similarity_signal=$(safe_json_num "$metrics" '.convergence.signals.similarity_trend' "0")
+    verbose "show_stats_full: signals output=$output_signal change=$change_signal similarity=$similarity_signal"
+
+    echo "CONVERGENCE SIGNALS" >&2
+    printf "  %s Output size trend (%.2f)\n" "$( [[ $(echo "$output_signal >= 0.7" | bc 2>/dev/null || echo 0) -eq 1 ]] && echo "✓" || echo "·" )" "$output_signal" >&2
+    printf "  %s Change velocity (%.2f)\n" "$( [[ $(echo "$change_signal >= 0.7" | bc 2>/dev/null || echo 0) -eq 1 ]] && echo "✓" || echo "·" )" "$change_signal" >&2
+    printf "  %s Similarity trend (%.2f)\n" "$( [[ $(echo "$similarity_signal >= 0.7" | bc 2>/dev/null || echo 0) -eq 1 ]] && echo "✓" || echo "·" )" "$similarity_signal" >&2
+    echo "" >&2
+
+    if [[ "$STATS_DETAILED" == "true" ]]; then
+        local last_round
+        last_round=$(echo "$metrics" | jq -c '.rounds | sort_by(.round) | .[-1]')
+        if [[ -n "$last_round" ]]; then
+            echo "DOCUMENT METRICS (LATEST ROUND)" >&2
+            local doc_section doc_name
+            for doc_name in readme spec implementation; do
+                doc_section=$(echo "$last_round" | jq -c --arg name "$doc_name" '.documents[$name] // null' 2>/dev/null || echo "null")
+                if [[ "$doc_section" == "null" || -z "$doc_section" ]]; then
+                    continue
+                fi
+                local chars words lines headings code_blocks links lists
+                chars=$(safe_json_num "$doc_section" '.char_count' "0")
+                words=$(safe_json_num "$doc_section" '.word_count' "0")
+                lines=$(safe_json_num "$doc_section" '.line_count' "0")
+                headings=$(safe_json_num "$doc_section" '.heading_count' "0")
+                code_blocks=$(safe_json_num "$doc_section" '.code_block_count' "0")
+                links=$(safe_json_num "$doc_section" '.link_count' "0")
+                lists=$(safe_json_num "$doc_section" '.list_item_count' "0")
+
+                printf "  %s: chars=%s words=%s lines=%s headings=%s code=%s links=%s lists=%s\n" \
+                    "$doc_name" "$chars" "$words" "$lines" "$headings" "$code_blocks" "$links" "$lists" >&2
+            done
+            echo "" >&2
+        fi
+    fi
+
+    local confidence_msg
+    if [[ $(echo "$confidence >= 0.90" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+        confidence_msg="Specification appears stable. Consider stopping soon."
+    elif [[ $(echo "$confidence >= 0.75" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+        confidence_msg="Nearly converged. Consider 1-2 more rounds."
+    elif [[ $(echo "$confidence >= 0.50" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
+        confidence_msg="Approaching convergence. More rounds recommended."
+    else
+        confidence_msg="Significant changes still occurring."
+    fi
+    print_info "$confidence_msg"
+}
+
 show_stats() {
     local workflow="${WORKFLOW:-default}"
 
@@ -2874,11 +3291,27 @@ show_stats() {
         exit $EXIT_CONFIG_ERROR
     fi
 
+    if [[ "$STATS_JSON" == "true" ]]; then
+        if command -v jq &>/dev/null && metrics_exists "$workflow"; then
+            metrics_read "$workflow"
+        else
+            print_warning "No metrics available; outputting empty JSON"
+            echo "{}"
+        fi
+        return 0
+    fi
+
     local rounds_dir="$CONFIG_DIR/rounds/$workflow"
     if [[ ! -d "$rounds_dir" ]]; then
         print_warning "No rounds recorded yet for workflow '$workflow'"
         print_info "Run 'apr run 1' to start your first revision round"
         exit $EXIT_SUCCESS
+    fi
+
+    if command -v jq &>/dev/null && metrics_exists "$workflow"; then
+        if show_stats_full "$workflow"; then
+            return 0
+        fi
     fi
 
     # Collect round data
@@ -3420,6 +3853,45 @@ robot_history() {
     robot_json true "ok" "$data"
 }
 
+# Robot: Stats - Analytics metrics summary
+robot_stats() {
+    if ! command -v jq &>/dev/null; then
+        robot_json false "dependency_missing" '{"dependency":"jq"}' "Robot stats requires jq"
+        return 1
+    fi
+
+    local workflow="${WORKFLOW:-default}"
+    if ! metrics_exists "$workflow"; then
+        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "metrics", workflow: $wf}')" \
+            "No metrics found. Run some rounds or backfill."
+        return 1
+    fi
+
+    local metrics round_count avg_size convergence rounds
+    metrics=$(metrics_read "$workflow") || return 1
+    round_count=$(echo "$metrics" | jq -r '.rounds | length' 2>/dev/null || echo "0")
+    avg_size=$(echo "$metrics" | jq -r '[.rounds[].output.char_count // 0] | if length > 0 then (add / length) else 0 end' 2>/dev/null || echo "0")
+    convergence=$(echo "$metrics" | jq -c '.convergence // {}' 2>/dev/null || echo "{}")
+    rounds=$(echo "$metrics" | jq -c '.rounds' 2>/dev/null || echo "[]")
+
+    local data
+    data=$(jq -nc \
+        --arg workflow "$workflow" \
+        --argjson round_count "$round_count" \
+        --argjson average_output_size "$avg_size" \
+        --argjson convergence "$convergence" \
+        --argjson rounds "$rounds" \
+        '{
+            workflow: $workflow,
+            round_count: $round_count,
+            average_output_size: $average_output_size,
+            convergence: $convergence,
+            rounds: $rounds
+        }')
+
+    robot_json true "ok" "$data"
+}
+
 # Robot: Help - Show robot mode help in JSON
 robot_help() {
     local data
@@ -3433,6 +3905,7 @@ robot_help() {
             validate: "Pre-run validation (apr robot validate <round>)",
             run: "Execute revision round (apr robot run <round>)",
             history: "List revision rounds for workflow",
+            stats: "Show analytics metrics summary",
             help: "This help"
         },
         options: {
@@ -3446,7 +3919,8 @@ robot_help() {
             "apr robot validate 1 -w myspec",
             "apr robot run 1",
             "apr robot run 2 -w myspec --include-impl",
-            "apr robot history -w myspec"
+            "apr robot history -w myspec",
+            "apr robot stats -w myspec"
         ]
     }')
 
@@ -3524,6 +3998,9 @@ cmd_robot() {
         history)
             robot_history
             ;;
+        stats)
+            robot_stats
+            ;;
         help|--help|-h)
             robot_help
             ;;
@@ -3589,6 +4066,8 @@ show_help() {
         gum style --faint "  --no-preflight       Skip pre-flight validation checks" >&2
         gum style --faint "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         gum style --faint "  --hours NUM          Status window in hours (default: 72)" >&2
+        gum style --faint "  --detailed           Show detailed metrics in stats" >&2
+        gum style --faint "  --json               Output stats as raw JSON" >&2
         gum style --faint "  -v, --verbose        Show detailed debug output" >&2
         gum style --faint "  -q, --quiet          Minimal output (errors only)" >&2
         gum style --faint "  --version            Show version" >&2
@@ -3686,6 +4165,8 @@ show_help() {
         echo "  --no-preflight       Skip pre-flight validation checks" >&2
         echo "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         echo "  --hours NUM          Status window in hours (default: 72)" >&2
+        echo "  --detailed           Show detailed metrics in stats" >&2
+        echo "  --json               Output stats as raw JSON" >&2
         echo "  -v, --verbose        Show detailed debug output" >&2
         echo "  -q, --quiet          Minimal output (errors only)" >&2
         echo "  --version            Show version" >&2
@@ -3792,6 +4273,8 @@ main() {
     ENABLE_RETRY=true
     INTEGRATE_OUTPUT=""
     STATUS_HOURS="${APR_STATUS_HOURS:-72}"
+    STATS_DETAILED=false
+    STATS_JSON=false
 
     local positional_args=()
 
@@ -3860,6 +4343,14 @@ main() {
                 fi
                 STATUS_HOURS="$2"
                 shift 2
+                ;;
+            --detailed)
+                STATS_DETAILED=true
+                shift
+                ;;
+            --json)
+                STATS_JSON=true
+                shift
                 ;;
             -q|--quiet)
                 QUIET_MODE=true
