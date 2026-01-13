@@ -737,6 +737,79 @@ Backfill analyzes each round's output file and generates:
 - Timestamps from file metadata
 - Baseline data for convergence calculations
 
+### Interactive Dashboard
+
+For a full-screen analytics experience:
+
+```bash
+apr dashboard
+```
+
+The dashboard provides:
+- Real-time convergence gauge visualization
+- Round-by-round output size trends
+- Navigation with keyboard shortcuts (↑↓ navigate, Enter view details, d diff, q quit)
+- Summary statistics at a glance
+
+### Data Export
+
+Export metrics for external analysis or reporting:
+
+```bash
+# JSON format (full metrics structure)
+apr stats --export json > metrics.json
+
+# CSV format (tabular data for spreadsheets)
+apr stats --export csv > metrics.csv
+
+# Markdown report (human-readable summary)
+apr stats --export md > report.md
+
+# Export specific round range
+apr stats --export json --rounds 3-5
+
+# Export to file directly
+apr stats --export csv -o metrics.csv
+```
+
+Example JSON export structure:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "workflow": "my-project",
+  "rounds": [
+    {
+      "round": 1,
+      "timestamp": "2026-01-10T14:30:00Z",
+      "output": {
+        "char_count": 15200,
+        "word_count": 2500,
+        "line_count": 320
+      }
+    }
+  ],
+  "convergence": {
+    "detected": false,
+    "confidence": 0.78,
+    "signals": {
+      "output_trend": 0.85,
+      "change_velocity": 0.75,
+      "similarity_trend": 0.72
+    }
+  }
+}
+```
+
+Example CSV export:
+
+```csv
+"round","timestamp","output_chars","output_words","output_lines","similarity","convergence_score"
+1,"2026-01-10T14:30:00Z",15200,2500,320,"",0.0
+2,"2026-01-10T16:45:00Z",14100,2350,298,0.72,0.45
+3,"2026-01-11T09:15:00Z",12800,2150,275,0.81,0.68
+```
+
 ---
 
 ## 🛡️ Reliability Features
