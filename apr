@@ -1548,6 +1548,28 @@ metrics_write_atomic() {
 # Document Metrics Collection (fzi.3)
 # -----------------------------------------------------------------------------
 
+# collect_document_metrics - Extract quantitative metrics from a markdown file
+#
+# Metrics collected:
+#   - char_count: Total characters
+#   - word_count: Total words
+#   - line_count: Total lines
+#   - heading_count: Markdown headings (lines starting with #)
+#   - code_block_count: Fenced code blocks (``` pairs)
+#   - link_count: Markdown links [text](url)
+#   - list_item_count: Bullet/numbered list items
+#
+# Arguments:
+#   $1 - file_path: Path to markdown file (returns null if missing)
+#   $2 - doc_type: Document type identifier ("readme", "spec", "output")
+#
+# Output:
+#   JSON object with metrics, or "null" if file missing
+#
+# Example:
+#   metrics=$(collect_document_metrics "README.md" "readme")
+#   echo "$metrics" | jq ".word_count"
+#
 collect_document_metrics() {
     local file_path="$1"
     local doc_type="${2:-document}"
@@ -1804,8 +1826,29 @@ calculate_round_changes() {
 
 # -----------------------------------------------------------------------------
 # Convergence Detection (fzi.5)
+#
+# These functions analyze revision history to detect when a specification
+# has stabilized. The convergence score is a weighted combination of three
+# independent signals:
+#
+#   Score = (0.35 × output_trend) + (0.35 × change_velocity) + (0.30 × similarity_trend)
+#
+# Each signal returns 0.0..1.0 where higher values indicate convergence.
+# A combined score >= 0.75 indicates high confidence of convergence.
 # -----------------------------------------------------------------------------
 
+# calculate_output_trend_signal - Detect decreasing output size trend
+#
+# GPT Pro's feedback typically decreases in size as specifications mature.
+# Early rounds produce lengthy analyses; convergence shows as more focused,
+# briefer feedback. Compares average output size of first half vs second half
+# of recent rounds.
+#
+# Arguments:
+#   $1 - metrics_json: Full metrics JSON containing rounds array
+#
+# Returns: Signal value 0.0..1.0 (1.0 = strong decreasing trend)
+#
 calculate_output_trend_signal() {
     local metrics_json="$1"
 
@@ -1861,6 +1904,17 @@ calculate_output_trend_signal() {
     echo "$signal"
 }
 
+# calculate_change_velocity_signal - Detect slowing rate of changes
+#
+# The rate of changes typically slows as the specification matures. Uses
+# the diff_ratio metric (lines changed / total lines) to measure change
+# velocity. Lower average diff_ratio indicates convergence.
+#
+# Arguments:
+#   $1 - metrics_json: Full metrics JSON containing rounds array
+#
+# Returns: Signal value 0.0..1.0 (1.0 = very low change velocity)
+#
 calculate_change_velocity_signal() {
     local metrics_json="$1"
 
@@ -1897,6 +1951,17 @@ calculate_change_velocity_signal() {
     echo "$signal"
 }
 
+# calculate_similarity_trend_signal - Detect increasing content similarity
+#
+# Successive outputs should become more similar as the specification stabilizes.
+# Uses word-level overlap (similarity_score) between consecutive rounds.
+# Higher average similarity indicates convergence.
+#
+# Arguments:
+#   $1 - metrics_json: Full metrics JSON containing rounds array
+#
+# Returns: Signal value 0.0..1.0 (1.0 = very high similarity)
+#
 calculate_similarity_trend_signal() {
     local metrics_json="$1"
 
@@ -1933,6 +1998,26 @@ calculate_similarity_trend_signal() {
     echo "$signal"
 }
 
+# calculate_convergence - Compute overall convergence score and estimate
+#
+# Combines the three convergence signals with weights:
+#   - output_trend: 35% (decreasing feedback length)
+#   - change_velocity: 35% (slowing rate of changes)
+#   - similarity_trend: 30% (increasing content similarity)
+#
+# Also estimates remaining rounds based on current trajectory.
+#
+# Arguments:
+#   $1 - workflow: Workflow name to calculate convergence for
+#
+# Output: JSON object with convergence data:
+#   {
+#     "detected": true/false,     // true if confidence >= 0.75
+#     "confidence": 0.0..1.0,     // weighted signal combination
+#     "estimated_rounds_remaining": N or null,
+#     "signals": { output_size_trend, change_velocity, similarity_trend }
+#   }
+#
 calculate_convergence() {
     local workflow="$1"
 
@@ -3766,6 +3851,15 @@ dashboard_format_duration() {
     fi
 }
 
+dashboard_format_nullable() {
+    local value="${1:-}"
+    if [[ -z "$value" || "$value" == "null" ]]; then
+        echo "-"
+        return 0
+    fi
+    echo "$value"
+}
+
 dashboard_hide_cursor() {
     printf '\033[?25l' >&2
 }
@@ -3934,13 +4028,13 @@ dashboard_render_round_table() {
         local round_num size added deleted similarity ts
         round_num="${DASHBOARD_ROUND_NUMS[$i]}"
         size="$(format_bytes "${DASHBOARD_ROUND_SIZES[$i]}")"
-        added="${DASHBOARD_ROUND_ADDED[$i]}"
-        deleted="${DASHBOARD_ROUND_DELETED[$i]}"
+        added="$(dashboard_format_nullable "${DASHBOARD_ROUND_ADDED[$i]}")"
+        deleted="$(dashboard_format_nullable "${DASHBOARD_ROUND_DELETED[$i]}")"
         similarity="$(format_float "${DASHBOARD_ROUND_SIMILARITY[$i]}")"
         ts="$(format_iso_date "${DASHBOARD_ROUND_TS[$i]}")"
 
         printf " %s %3s %7s %5s %5s %6s %10s\n" "$marker" "$round_num" "$size" \
-            "${added:-"-"}" "${deleted:-"-"}" "$similarity" "$ts" >&2
+            "$added" "$deleted" "$similarity" "$ts" >&2
     done
     printf "\n" >&2
     printf "Keys: Enter=details  d=diff  r=refresh  ?=help  q=quit\n" >&2
@@ -3965,8 +4059,10 @@ dashboard_show_round_detail() {
     local workflow="$2"
     local round_num="${DASHBOARD_ROUND_NUMS[$idx]}"
     local size="${DASHBOARD_ROUND_SIZES[$idx]}"
-    local added="${DASHBOARD_ROUND_ADDED[$idx]}"
-    local deleted="${DASHBOARD_ROUND_DELETED[$idx]}"
+    local added
+    local deleted
+    added="$(dashboard_format_nullable "${DASHBOARD_ROUND_ADDED[$idx]}")"
+    deleted="$(dashboard_format_nullable "${DASHBOARD_ROUND_DELETED[$idx]}")"
     local similarity="${DASHBOARD_ROUND_SIMILARITY[$idx]}"
     local ts="${DASHBOARD_ROUND_TS[$idx]}"
 
@@ -3974,8 +4070,8 @@ dashboard_show_round_detail() {
     printf "ROUND %s DETAILS (%s)\n" "$round_num" "$workflow" >&2
     printf "──────────────────────────────\n" >&2
     printf "Output size: %s\n" "$(format_bytes "$size")" >&2
-    printf "Lines added: %s\n" "${added:-"-"}" >&2
-    printf "Lines del:   %s\n" "${deleted:-"-"}" >&2
+    printf "Lines added: %s\n" "$added" >&2
+    printf "Lines del:   %s\n" "$deleted" >&2
     printf "Similarity:  %s\n" "$(format_float "$similarity")" >&2
     printf "Timestamp:   %s\n" "$(format_iso_date "$ts")" >&2
     printf "\nPress any key to return...\n" >&2
@@ -4187,7 +4283,7 @@ backfill_workflow() {
         print_dim "  Analyzing round $round_num..."
 
         if [[ "$dry_run" == "true" ]]; then
-            ((count++))
+            ((count++)) || true
             prev_output="$round_file"
             continue
         fi
@@ -4229,7 +4325,7 @@ backfill_workflow() {
         fi
 
         prev_output="$round_file"
-        ((count++))
+        ((count++)) || true
     done
 
     if [[ "$dry_run" == "true" ]]; then
@@ -4261,7 +4357,7 @@ backfill_all_workflows() {
         local name
         name=$(basename "$config" .yaml)
         backfill_workflow "$name" "$force" "$dry_run" || true
-        ((count++))
+        ((count++)) || true
     done
 
     print_success "Processed $count workflow(s)"
