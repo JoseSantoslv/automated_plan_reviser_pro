@@ -432,10 +432,10 @@ print_banner() {
             "  Iterative AI-Powered Spec Refinement" >&2
     else
         echo "" >&2
-        echo -e "${BOLD}${MAGENTA}╔════════════════════════════════════════════════════════════╗${NC}" >&2
-        echo -e "${BOLD}${MAGENTA}║${NC}  ${BOLD}${WHITE}  Automated Plan Reviser Pro${NC} ${DIM}v${VERSION}${NC}               ${BOLD}${MAGENTA}║${NC}" >&2
-        echo -e "${BOLD}${MAGENTA}║${NC}  ${DIM}Iterative AI-Powered Spec Refinement${NC}                     ${BOLD}${MAGENTA}║${NC}" >&2
-        echo -e "${BOLD}${MAGENTA}╚════════════════════════════════════════════════════════════╝${NC}" >&2
+        echo -e "${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+        echo -e "  ${BOLD}${WHITE}Automated Plan Reviser Pro${NC} ${DIM}v${VERSION}${NC}" >&2
+        echo -e "  ${DIM}Iterative AI-Powered Spec Refinement${NC}" >&2
+        echo -e "${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
         echo "" >&2
     fi
 }
@@ -637,6 +637,53 @@ get_config_value() {
     grep -E "^[[:space:]]*${key}:" "$config_file" 2>/dev/null | head -1 | cut -d':' -f2- | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//'
 }
 
+# Build the revision prompt for GPT Pro review
+# Usage: build_revision_prompt [include_impl]
+# Returns prompt via stdout
+build_revision_prompt() {
+    local include_impl="${1:-false}"
+
+    local prompt="First, read this README:
+
+\`\`\`
+<contents of README will be included by oracle>
+\`\`\`
+
+---
+"
+
+    if [[ "$include_impl" == "true" ]]; then
+        prompt+="
+And here is a document detailing the implementation; you should also keep
+the implementation in mind as you think about the specification, since
+ultimately the specification needs to be translated into code eventually!
+
+\`\`\`
+<contents of implementation will be included by oracle>
+\`\`\`
+
+---
+"
+    fi
+
+    prompt+="
+NOW: Carefully review this entire plan for me and come up with your best
+revisions in terms of better architecture, new features, changed features,
+etc. to make it better, more robust/reliable, more performant, more
+compelling/useful, etc.
+
+For each proposed change, give me your detailed analysis and
+rationale/justification for why it would make the project better along
+with the git-diff style change versus the original plan shown below:
+
+\`\`\`
+<contents of spec will be included by oracle>
+\`\`\`
+"
+
+    echo "$prompt"
+}
+
 # -----------------------------------------------------------------------------
 # Interactive Setup Wizard
 # -----------------------------------------------------------------------------
@@ -655,12 +702,11 @@ run_setup() {
             "This will help you configure a new revision workflow." \
             "You'll specify your documents and review preferences." >&2
     else
-        echo -e "${CYAN}╭────────────────────────────────────────────────────────────╮${NC}" >&2
-        echo -e "${CYAN}│${NC}  ${BOLD}Welcome to the APR Setup Wizard!${NC}                         ${CYAN}│${NC}" >&2
-        echo -e "${CYAN}│${NC}                                                            ${CYAN}│${NC}" >&2
-        echo -e "${CYAN}│${NC}  This will help you configure a new revision workflow.     ${CYAN}│${NC}" >&2
-        echo -e "${CYAN}│${NC}  You'll specify your documents and review preferences.     ${CYAN}│${NC}" >&2
-        echo -e "${CYAN}╰────────────────────────────────────────────────────────────╯${NC}" >&2
+        echo "" >&2
+        echo -e "${BOLD}Welcome to the APR Setup Wizard!${NC}" >&2
+        echo "" >&2
+        echo "  This will help you configure a new revision workflow." >&2
+        echo "  You'll specify your documents and review preferences." >&2
     fi
     echo "" >&2
 
@@ -795,15 +841,14 @@ EOF
             "To run with implementation doc:" \
             "  apr run 1 --include-impl" >&2
     else
-        echo -e "${GREEN}╭────────────────────────────────────────────────────────────╮${NC}" >&2
-        echo -e "${GREEN}│${NC}  ${BOLD}✓ Workflow '$workflow_name' created successfully!${NC}" >&2
-        echo -e "${GREEN}│${NC}" >&2
-        echo -e "${GREEN}│${NC}  To run your first revision round:" >&2
-        echo -e "${GREEN}│${NC}    ${CYAN}apr run 1${NC}" >&2
-        echo -e "${GREEN}│${NC}" >&2
-        echo -e "${GREEN}│${NC}  To run with implementation doc:" >&2
-        echo -e "${GREEN}│${NC}    ${CYAN}apr run 1 --include-impl${NC}" >&2
-        echo -e "${GREEN}╰────────────────────────────────────────────────────────────╯${NC}" >&2
+        echo "" >&2
+        print_success "Workflow '$workflow_name' created successfully!"
+        echo "" >&2
+        echo "  To run your first revision round:" >&2
+        echo -e "    ${CYAN}apr run 1${NC}" >&2
+        echo "" >&2
+        echo "  To run with implementation doc:" >&2
+        echo -e "    ${CYAN}apr run 1 --include-impl${NC}" >&2
     fi
 }
 
@@ -861,6 +906,19 @@ run_round() {
         slug="${slug}-with-impl"
     fi
 
+    # Warn if output file already exists
+    if [[ -f "$output_file" && "$dry_run" != "true" && "$render" != "true" ]]; then
+        local file_size
+        file_size=$(du -h "$output_file" 2>/dev/null | cut -f1)
+        print_warning "Round $round_num output already exists ($file_size)"
+        if can_prompt; then
+            if ! confirm "Overwrite existing output?"; then
+                print_info "Cancelled. Use a different round number or backup the file."
+                exit $EXIT_SUCCESS
+            fi
+        fi
+    fi
+
     if [[ "$GUM_AVAILABLE" == "true" && "$QUIET_MODE" != "true" ]]; then
         gum style \
             --border rounded \
@@ -891,45 +949,9 @@ run_round() {
     fi
     file_args+=(--file "$spec_path")
 
-    # Build prompt
+    # Build prompt using shared function
     local prompt
-    prompt="First, read this README:
-
-\`\`\`
-<contents of README will be included by oracle>
-\`\`\`
-
----
-"
-
-    if [[ "$include_impl" == "true" && -n "$impl_path" ]]; then
-        prompt+="
-And here is a document detailing the implementation; you should also keep
-the implementation in mind as you think about the specification, since
-ultimately the specification needs to be translated into code eventually!
-
-\`\`\`
-<contents of implementation will be included by oracle>
-\`\`\`
-
----
-"
-    fi
-
-    prompt+="
-NOW: Carefully review this entire plan for me and come up with your best
-revisions in terms of better architecture, new features, changed features,
-etc. to make it better, more robust/reliable, more performant, more
-compelling/useful, etc.
-
-For each proposed change, give me your detailed analysis and
-rationale/justification for why it would make the project better along
-with the git-diff style change versus the original plan shown below:
-
-\`\`\`
-<contents of spec will be included by oracle>
-\`\`\`
-"
+    prompt=$(build_revision_prompt "$include_impl")
 
     # Dry run mode
     if [[ "$dry_run" == "true" ]]; then
@@ -1044,8 +1066,9 @@ with the git-diff style change versus the original plan shown below:
 show_status() {
     print_banner
     print_header "ORACLE SESSION STATUS"
+    print_info "Showing sessions from last ${STATUS_HOURS}h"
     echo "" >&2
-    $ORACLE_CMD status --hours 72
+    $ORACLE_CMD status --hours "$STATUS_HOURS"
 }
 
 attach_session() {
@@ -1072,21 +1095,42 @@ list_workflows() {
         exit $EXIT_SUCCESS
     fi
 
+    # Get default workflow
+    local default_wf=""
+    if [[ -f "$CONFIG_DIR/config.yaml" ]]; then
+        default_wf=$(get_config_value "default_workflow" "$CONFIG_DIR/config.yaml")
+    fi
+
+    local found_any=false
     for config in "$workflow_dir"/*.yaml; do
         [[ -f "$config" ]] || continue
-        local name desc
+        found_any=true
+        local name desc is_default=""
         name=$(basename "$config" .yaml)
         desc=$(get_config_value "description" "$config")
 
+        if [[ "$name" == "$default_wf" ]]; then
+            is_default=" (default)"
+        fi
+
         if [[ "$GUM_AVAILABLE" == "true" ]]; then
-            gum style --foreground 82 --bold "$name" >&2
+            if [[ -n "$is_default" ]]; then
+                gum style --foreground 82 --bold "$name" --suffix " $(gum style --faint '(default)')" >&2
+            else
+                gum style --foreground 82 --bold "$name" >&2
+            fi
             gum style --faint "  $desc" >&2
         else
-            echo -e "  ${GREEN}${BOLD}$name${NC}" >&2
+            echo -e "  ${GREEN}${BOLD}$name${NC}${DIM}$is_default${NC}" >&2
             echo -e "    ${DIM}$desc${NC}" >&2
         fi
         echo "" >&2
     done
+
+    if [[ "$found_any" == "false" ]]; then
+        print_warning "No workflows configured yet"
+        print_info "Run 'apr setup' to create your first workflow"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1095,13 +1139,23 @@ list_workflows() {
 
 show_history() {
     local workflow="${WORKFLOW:-default}"
+
+    # Verify workflow exists
+    local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
+    if [[ ! -f "$workflow_file" ]]; then
+        print_error "Workflow '$workflow' not found"
+        print_info "Run 'apr list' to see available workflows"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
     print_banner
     print_header "REVISION HISTORY: $workflow"
     echo "" >&2
 
     local rounds_dir="$CONFIG_DIR/rounds/$workflow"
     if [[ ! -d "$rounds_dir" ]]; then
-        print_warning "No rounds recorded for workflow '$workflow'"
+        print_warning "No rounds recorded yet for workflow '$workflow'"
+        print_info "Run 'apr run 1' to start your first revision round"
         exit $EXIT_SUCCESS
     fi
 
@@ -1117,6 +1171,44 @@ show_history() {
 
         echo -e "  ${CYAN}Round $round_num${NC}  ${DIM}$size${NC}  ${DIM}$mod_date${NC}" >&2
     done
+}
+
+# -----------------------------------------------------------------------------
+# Show Round Output
+# -----------------------------------------------------------------------------
+
+show_round() {
+    local round_num="$1"
+    local workflow="${WORKFLOW:-default}"
+
+    # Verify workflow exists
+    local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
+    if [[ ! -f "$workflow_file" ]]; then
+        print_error "Workflow '$workflow' not found"
+        print_info "Run 'apr list' to see available workflows"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    local output_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
+
+    if [[ ! -f "$output_file" ]]; then
+        print_error "Round $round_num not found for workflow '$workflow'"
+        print_info "Run 'apr history' to see available rounds"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    # If pager is available and stdout is a tty, use it
+    if [[ -t 1 ]]; then
+        if command -v bat &>/dev/null; then
+            bat --style=plain --language=markdown "$output_file"
+        elif command -v less &>/dev/null; then
+            less "$output_file"
+        else
+            cat "$output_file"
+        fi
+    else
+        cat "$output_file"
+    fi
 }
 
 # =============================================================================
@@ -1421,44 +1513,9 @@ robot_run() {
     fi
     file_args+=(--file "$spec_path")
 
-    # Build prompt
-    local prompt="First, read this README:
-
-\`\`\`
-<contents of README will be included by oracle>
-\`\`\`
-
----
-"
-
-    if [[ "$include_impl" == "true" && -n "$impl_path" ]]; then
-        prompt+="
-And here is a document detailing the implementation; you should also keep
-the implementation in mind as you think about the specification, since
-ultimately the specification needs to be translated into code eventually!
-
-\`\`\`
-<contents of implementation will be included by oracle>
-\`\`\`
-
----
-"
-    fi
-
-    prompt+="
-NOW: Carefully review this entire plan for me and come up with your best
-revisions in terms of better architecture, new features, changed features,
-etc. to make it better, more robust/reliable, more performant, more
-compelling/useful, etc.
-
-For each proposed change, give me your detailed analysis and
-rationale/justification for why it would make the project better along
-with the git-diff style change versus the original plan shown below:
-
-\`\`\`
-<contents of spec will be included by oracle>
-\`\`\`
-"
+    # Build prompt using shared function
+    local prompt
+    prompt=$(build_revision_prompt "$include_impl")
 
     # Create output directory
     mkdir -p "$(dirname "$output_file")" 2>/dev/null
@@ -1640,6 +1697,7 @@ show_help() {
         gum style --foreground 39 "  Management" >&2
         echo "    $(gum style --foreground 82 'list')               List configured workflows" >&2
         echo "    $(gum style --foreground 82 'history')            Show revision history" >&2
+        echo "    $(gum style --foreground 82 'show <round>')       View round output" >&2
         echo "    $(gum style --foreground 82 'update')             Check for and install updates" >&2
         echo "    $(gum style --foreground 82 'help')               Show this help message" >&2
         echo "" >&2
@@ -1656,6 +1714,7 @@ show_help() {
         gum style --faint "  --wait               Wait for completion (blocking)" >&2
         gum style --faint "  --login              Manual login mode (first-time setup)" >&2
         gum style --faint "  --keep-browser       Keep browser open after completion" >&2
+        gum style --faint "  --hours NUM          Status window in hours (default: 72)" >&2
         gum style --faint "  -q, --quiet          Minimal output (errors only)" >&2
         gum style --faint "  --version            Show version" >&2
         echo "" >&2
@@ -1664,6 +1723,7 @@ show_help() {
         gum style --faint "  APR_HOME             Data directory (~/.local/share/apr)" >&2
         gum style --faint "  APR_CACHE            Cache directory (~/.cache/apr)" >&2
         gum style --faint "  APR_CHECK_UPDATES    Enable daily update checking (set to 1)" >&2
+        gum style --faint "  APR_STATUS_HOURS     Default status time window (default: 72)" >&2
         gum style --faint "  APR_NO_GUM           Disable gum even if available" >&2
         gum style --faint "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
@@ -1717,6 +1777,7 @@ show_help() {
         echo -e "  ${CYAN}Management${NC}" >&2
         echo -e "    ${GREEN}list${NC}               List configured workflows" >&2
         echo -e "    ${GREEN}history${NC}            Show revision history" >&2
+        echo -e "    ${GREEN}show <round>${NC}       View round output" >&2
         echo -e "    ${GREEN}update${NC}             Check for and install updates" >&2
         echo -e "    ${GREEN}help${NC}               Show this help message" >&2
         echo "" >&2
@@ -1732,6 +1793,7 @@ show_help() {
         echo "  --wait               Wait for completion (blocking)" >&2
         echo "  --login              Manual login mode (first-time setup)" >&2
         echo "  --keep-browser       Keep browser open after completion" >&2
+        echo "  --hours NUM          Status window in hours (default: 72)" >&2
         echo "  -q, --quiet          Minimal output (errors only)" >&2
         echo "  --version            Show version" >&2
         echo "" >&2
@@ -1739,6 +1801,7 @@ show_help() {
         echo "  APR_HOME             Data directory (~/.local/share/apr)" >&2
         echo "  APR_CACHE            Cache directory (~/.cache/apr)" >&2
         echo "  APR_CHECK_UPDATES    Enable daily update checking (set to 1)" >&2
+        echo "  APR_STATUS_HOURS     Default status time window (default: 72)" >&2
         echo "  APR_NO_GUM           Disable gum even if available" >&2
         echo "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
@@ -1796,6 +1859,26 @@ main() {
 
     # Check Oracle availability (not needed for some commands)
     local command="${1:-help}"
+
+    # First-run experience: if no args and not configured, show welcome
+    if [[ "$command" == "help" && ! -d "$CONFIG_DIR" ]]; then
+        print_banner
+        echo "" >&2
+        print_header "WELCOME TO APR!"
+        echo "" >&2
+        echo "  APR automates iterative specification refinement using" >&2
+        echo "  GPT Pro Extended Reasoning via Oracle." >&2
+        echo "" >&2
+        print_info "To get started, run the setup wizard:"
+        echo "" >&2
+        echo -e "    ${CYAN}apr setup${NC}" >&2
+        echo "" >&2
+        print_dim "This will configure your workflow and document paths."
+        print_dim "For full documentation, run 'apr help'."
+        echo "" >&2
+        exit $EXIT_SUCCESS
+    fi
+
     if [[ "$command" != "help" && "$command" != "update" && "$command" != "robot" && "$command" != "--help" && "$command" != "-h" ]]; then
         if ! check_oracle; then
             print_error "Oracle not found"
@@ -1829,12 +1912,17 @@ main() {
     WAIT_MODE=false
     MANUAL_LOGIN=false
     KEEP_BROWSER=false
+    STATUS_HOURS="${APR_STATUS_HOURS:-72}"
 
     local positional_args=()
 
     while [[ $# -gt 0 ]]; do
         case $1 in
             -w|--workflow)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then
+                    print_error "Option -w requires a workflow name"
+                    exit $EXIT_USAGE_ERROR
+                fi
                 WORKFLOW="$2"
                 shift 2
                 ;;
@@ -1865,6 +1953,14 @@ main() {
             --keep-browser)
                 KEEP_BROWSER=true
                 shift
+                ;;
+            --hours)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then
+                    print_error "Option --hours requires a number"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                STATUS_HOURS="$2"
+                shift 2
                 ;;
             -q|--quiet)
                 QUIET_MODE=true
@@ -1925,6 +2021,14 @@ main() {
             ;;
         history)
             show_history
+            ;;
+        show)
+            if [[ ${#positional_args[@]} -lt 1 ]]; then
+                print_error "Round number required"
+                print_info "Usage: apr show <round>"
+                exit $EXIT_USAGE_ERROR
+            fi
+            show_round "${positional_args[0]}"
             ;;
         update)
             cmd_update

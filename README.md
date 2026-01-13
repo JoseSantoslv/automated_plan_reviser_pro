@@ -75,6 +75,74 @@ Each round, GPT Pro focuses on finer details because major issues were already a
 
 ---
 
+## Prepared Blurb for AGENTS.md Files
+
+Include this in your AGENTS.md file for any projects where you want to have access to APR:
+
+```markdown
+# APR (Automated Plan Reviser Pro) — Agent Reference
+
+Iterative specification refinement via GPT Pro Extended Reasoning. Automates
+multi-round AI review of specs, saving outputs for integration.
+
+## Quick Commands
+
+apr setup                      # Interactive workflow wizard (first time)
+apr run <N>                    # Run revision round N
+apr run <N> --include-impl     # Include implementation doc
+apr run <N> --dry-run          # Preview without executing
+apr status                     # Check Oracle session status
+apr attach <slug>              # Reattach to session
+apr list                       # List configured workflows
+apr history                    # Show round outputs for workflow
+apr update                     # Self-update to latest version
+
+## Robot Mode (JSON API for automation)
+
+apr robot status               # Environment & config info
+apr robot workflows            # List workflows with descriptions
+apr robot init                 # Initialize .apr/ directory
+apr robot validate <N>         # Pre-flight checks (run before expensive rounds!)
+apr robot run <N>              # Execute round, returns {slug, pid, output_file}
+apr robot help                 # Full API documentation
+
+All robot commands return: {ok, code, data, hint?, meta: {v, ts}}
+Error codes: ok | not_configured | not_found | validation_failed | oracle_error
+
+## Key Paths
+
+.apr/                          # Per-project config directory
+.apr/config.yaml               # Default workflow setting
+.apr/workflows/<name>.yaml     # Workflow definitions
+.apr/rounds/<workflow>/round_N.md  # GPT Pro outputs (this is what you integrate!)
+
+## Typical Agent Workflow
+
+1. Validate before running (saves 30+ min on failures):
+   result=$(apr robot validate 5 --workflow myspec)
+
+2. Run the round:
+   result=$(apr robot run 5 --workflow myspec)
+   slug=$(echo "$result" | jq -r '.data.slug')
+
+3. After completion, integrate .apr/rounds/<workflow>/round_N.md
+
+## Options
+
+-w, --workflow NAME    # Specify workflow (default: from config)
+-i, --include-impl     # Include implementation document
+-d, --dry-run          # Preview oracle command
+--wait                 # Block until completion
+--login                # Manual browser login (first time)
+
+## Dependencies
+
+Required: bash 4+, oracle (or npx @steipete/oracle), node 18+
+Optional: gum (TUI), jq (robot mode)
+```
+
+---
+
 ## The Core Insight: Iterative Convergence
 
 When you're designing a complex protocol specification, especially when security is involved, just one iteration of review by GPT Pro 5.2 with Extended Reasoning doesn't cut it.
@@ -101,6 +169,7 @@ With each round, the specification becomes "less wrong." Not only is this a good
 
 ## Table of Contents
 
+- [For Coding Agents](#for-coding-agents)
 - [The Core Insight](#the-core-insight-iterative-convergence)
 - [Why APR Exists](#-why-apr-exists)
 - [Highlights](#-highlights)
@@ -111,6 +180,8 @@ With each round, the specification becomes "less wrong." Not only is this a good
 - [The Workflow](#-the-workflow)
 - [Interactive Setup](#-interactive-setup)
 - [Session Monitoring](#-session-monitoring)
+- [Robot Mode](#-robot-mode-automation-api)
+- [Self-Update](#-self-update)
 - [The Inspiration](#-the-inspiration-flywheel-connector-protocol)
 - [Design Principles](#-design-principles)
 - [Architecture](#-architecture)
@@ -184,6 +255,28 @@ Full revision history:
 - Git-integrated workflow
 - History command for review
 - Multiple workflow support
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+### Robot Mode for Automation
+JSON API for coding agents:
+- Structured output for machine parsing
+- Pre-flight validation before expensive runs
+- Full status and workflow introspection
+- Seamless CI/CD integration
+
+</td>
+<td width="50%">
+
+### Secure Self-Update
+Keep APR current effortlessly:
+- One-command updates with `apr update`
+- SHA-256 checksum verification
+- Atomic installation (no partial updates)
+- Optional daily update checking
 
 </td>
 </tr>
@@ -449,6 +542,314 @@ APR automatically enables desktop notifications (via Oracle's `--notify` flag) s
 
 ---
 
+## 🤖 Robot Mode: Automation API
+
+APR's human-friendly terminal output is beautiful for interactive use, but coding agents and automation pipelines need structured, machine-readable data. Robot mode provides a complete JSON API that makes APR a first-class citizen in automated workflows.
+
+### Why Robot Mode Matters
+
+The iterative refinement workflow APR enables is exactly the kind of repetitive, multi-step process that benefits from automation. A coding agent like Claude Code can:
+
+1. **Validate before running** — Check that all preconditions are met before kicking off an expensive 30-minute GPT Pro review
+2. **Run rounds programmatically** — Execute `apr robot run 5` and parse the structured response
+3. **Monitor progress** — Query status and workflow information in a parseable format
+4. **Handle errors gracefully** — Semantic error codes and structured error messages enable intelligent retry logic
+
+### Response Format
+
+All robot mode commands return a consistent JSON envelope:
+
+```json
+{
+  "ok": true,
+  "code": "ok",
+  "data": { ... },
+  "hint": "Optional helpful message for debugging",
+  "meta": {
+    "v": "1.1.0",
+    "ts": "2026-01-12T19:14:00Z"
+  }
+}
+```
+
+When errors occur, `ok` becomes `false` and `code` contains a semantic error identifier:
+
+| Code | Meaning |
+|------|---------|
+| `ok` | Success |
+| `not_configured` | No `.apr/` directory found |
+| `not_found` | Requested resource doesn't exist |
+| `validation_failed` | Preconditions not met |
+| `oracle_error` | Oracle invocation failed |
+| `missing_argument` | Required argument not provided |
+| `dependency_missing` | jq or Oracle not available |
+
+### Commands
+
+#### `apr robot status`
+
+Returns complete configuration and environment status:
+
+```bash
+apr robot status
+```
+
+```json
+{
+  "ok": true,
+  "code": "ok",
+  "data": {
+    "configured": true,
+    "default_workflow": "fcp-spec",
+    "workflow_count": 2,
+    "workflows": ["fcp-spec", "auth-protocol"],
+    "oracle_available": true,
+    "oracle_method": "global",
+    "config_dir": "/home/user/project/.apr",
+    "apr_home": "/home/user/.local/share/apr"
+  }
+}
+```
+
+#### `apr robot workflows`
+
+Lists all configured workflows with their descriptions:
+
+```bash
+apr robot workflows
+```
+
+```json
+{
+  "ok": true,
+  "code": "ok",
+  "data": {
+    "workflows": [
+      {"name": "fcp-spec", "description": "Flywheel Connector Protocol specification"},
+      {"name": "auth-protocol", "description": "Authentication protocol design"}
+    ]
+  }
+}
+```
+
+#### `apr robot init`
+
+Initializes the `.apr/` directory structure. Idempotent—safe to call multiple times:
+
+```bash
+apr robot init
+```
+
+```json
+{
+  "ok": true,
+  "code": "ok",
+  "data": {
+    "created": true,
+    "existed": false
+  }
+}
+```
+
+#### `apr robot validate <round>`
+
+Pre-flight validation before running a round. This is the key command for automation—it checks all preconditions without actually running anything:
+
+```bash
+apr robot validate 5 --workflow fcp-spec
+```
+
+```json
+{
+  "ok": true,
+  "code": "ok",
+  "data": {
+    "valid": true,
+    "errors": [],
+    "warnings": [],
+    "workflow": "fcp-spec",
+    "round": "5"
+  }
+}
+```
+
+If validation fails:
+
+```json
+{
+  "ok": false,
+  "code": "validation_failed",
+  "data": {
+    "valid": false,
+    "errors": [
+      "Previous round output not found: .apr/rounds/fcp-spec/round_4.md",
+      "Specification file not found: SPEC.md"
+    ],
+    "warnings": ["Implementation file not configured"],
+    "workflow": "fcp-spec",
+    "round": "5"
+  }
+}
+```
+
+**Validation checks:**
+- Round number is valid and numeric
+- Configuration directory exists
+- Workflow exists and is readable
+- README and spec files exist
+- Oracle is available
+- Previous round exists (if round > 1)
+
+#### `apr robot run <round>`
+
+Executes a revision round and returns structured status:
+
+```bash
+apr robot run 5 --workflow fcp-spec --include-impl
+```
+
+```json
+{
+  "ok": true,
+  "code": "ok",
+  "data": {
+    "slug": "apr-fcp-spec-round-5-with-impl",
+    "pid": 12345,
+    "output_file": ".apr/rounds/fcp-spec/round_5.md",
+    "workflow": "fcp-spec",
+    "round": 5,
+    "include_impl": true,
+    "status": "running"
+  }
+}
+```
+
+The `slug` can be used with `apr attach` to monitor the session. The `output_file` will contain the GPT Pro response once complete.
+
+#### `apr robot help`
+
+Returns complete API documentation in JSON format—useful for coding agents to discover capabilities:
+
+```bash
+apr robot help
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--workflow NAME` | Specify workflow (default: from config) |
+| `--include-impl`, `-i` | Include implementation document |
+| `--compact` | Minified JSON output (no pretty-printing) |
+
+### Integration Example
+
+Here's how a coding agent might use robot mode:
+
+```bash
+# 1. Check environment
+status=$(apr robot status)
+if ! echo "$status" | jq -e '.data.oracle_available' > /dev/null; then
+    echo "Oracle not available"
+    exit 1
+fi
+
+# 2. Validate before running
+validation=$(apr robot validate 5 --workflow fcp-spec)
+if ! echo "$validation" | jq -e '.data.valid' > /dev/null; then
+    echo "Validation failed:"
+    echo "$validation" | jq '.data.errors[]'
+    exit 1
+fi
+
+# 3. Run the round
+result=$(apr robot run 5 --workflow fcp-spec)
+slug=$(echo "$result" | jq -r '.data.slug')
+output_file=$(echo "$result" | jq -r '.data.output_file')
+
+echo "Started session: $slug"
+echo "Output will be at: $output_file"
+```
+
+### Why This Design?
+
+Robot mode follows these principles:
+
+1. **Semantic error codes** — Machine-parseable error types enable intelligent error handling, not just string matching
+2. **Pre-flight validation** — Expensive Oracle runs (10-60 minutes) shouldn't fail due to missing files; validate first
+3. **Consistent envelope** — Every response has the same structure, making parsing trivial
+4. **Self-documenting** — The `help` command returns structured documentation
+5. **Minimal dependencies** — Only requires `jq` for JSON output formatting
+
+---
+
+## 🔄 Self-Update
+
+APR includes a secure self-update mechanism that keeps your installation current without requiring manual downloads or reinstallation.
+
+### How It Works
+
+```bash
+apr update
+```
+
+The update command:
+
+1. **Fetches the latest version** from GitHub with a 5-second timeout
+2. **Compares versions** using semantic versioning (e.g., `1.1.0 → 1.2.0`)
+3. **Shows what's available** and asks for confirmation
+4. **Downloads the new version** to a temporary location
+5. **Verifies the download** with multiple security checks
+6. **Installs atomically** — the old version is only replaced after verification succeeds
+
+### Security Features
+
+Self-update is designed with security as a priority:
+
+| Feature | Purpose |
+|---------|---------|
+| **SHA-256 checksums** | Verifies download integrity against published checksums |
+| **Script validation** | Confirms downloaded file is a valid bash script (has shebang) |
+| **Syntax checking** | Runs `bash -n` to verify script parses correctly |
+| **Atomic installation** | Uses temp file + move to prevent partial updates |
+| **Sudo detection** | Automatically elevates privileges for system directories |
+
+### Interactive Confirmation
+
+Updates always require confirmation:
+
+```
+╭────────────────────────────────────────────────────────────╮
+│  UPDATE AVAILABLE                                           │
+│                                                             │
+│  Current version: 1.1.0                                     │
+│  Latest version:  1.2.0                                     │
+│                                                             │
+│  Install update? [y/N]                                      │
+╰────────────────────────────────────────────────────────────╯
+```
+
+### Daily Update Checking
+
+For users who want to stay current, APR supports opt-in daily update notifications:
+
+```bash
+export APR_CHECK_UPDATES=1
+```
+
+With this enabled, APR checks for updates once per day (tracked in `~/.local/share/apr/.last_update_check`) and displays a non-blocking notification if a new version is available. The check uses a 5-second timeout and never interrupts your workflow.
+
+### Why Self-Update?
+
+APR is a rapidly evolving tool. New features, bug fixes, and improvements are released frequently. Self-update ensures:
+
+1. **Low friction** — No need to re-run the installer or remember download URLs
+2. **Security** — Checksum verification prevents tampering
+3. **Reliability** — Atomic updates mean no corrupted installations
+4. **User control** — Updates are never automatic; you always confirm
+
+---
+
 ## 📖 The Inspiration: Flywheel Connector Protocol
 
 APR was built to automate the workflow used to develop the [Flywheel Connector Protocol](https://github.com/Dicklesworthstone/flywheel_connectors):
@@ -579,6 +980,22 @@ Everything has fallbacks:
 - Oracle global → npx
 - Interactive → CLI flags
 
+### 5. Dual Interface
+
+APR serves two audiences with the same codebase:
+- **Humans** get beautiful gum-styled output, interactive wizards, and progress indicators
+- **Machines** get structured JSON via robot mode, semantic error codes, and pre-flight validation
+
+This isn't just about having two output formats—it's about recognizing that iterative refinement workflows benefit immensely from automation, and a tool that only works interactively leaves value on the table.
+
+### 6. Secure by Default
+
+Security considerations are woven throughout:
+- **No credential storage** — APR never touches your ChatGPT credentials; Oracle uses browser cookies
+- **Checksum verification** — Downloads are verified against published SHA-256 checksums
+- **Atomic operations** — Updates either complete fully or don't happen at all
+- **User consent** — Nothing destructive happens without explicit confirmation
+
 ---
 
 ## 🏗️ Architecture
@@ -586,21 +1003,39 @@ Everything has fallbacks:
 ### Component Overview
 
 ```
-apr (bash script, ~1700 LOC)
-├── Gum integration (beautiful TUI)
-├── Oracle detection (global or npx)
-├── Interactive setup wizard
-├── Round execution
-├── Session monitoring
-└── History tracking
+apr (bash script, ~1950 LOC)
+├── Core Commands
+│   ├── run           # Execute revision rounds
+│   ├── setup         # Interactive workflow wizard
+│   ├── status        # Oracle session status
+│   ├── attach        # Reattach to sessions
+│   ├── list          # List workflows
+│   └── history       # Round history
+├── Robot Mode        # JSON API for automation
+│   ├── status        # Environment introspection
+│   ├── workflows     # List workflows
+│   ├── init          # Initialize .apr/
+│   ├── validate      # Pre-flight checks
+│   ├── run           # Execute rounds
+│   └── help          # API documentation
+├── Self-Update       # Secure update mechanism
+│   ├── Version comparison
+│   ├── Checksum verification
+│   └── Atomic installation
+├── Gum Integration   # Beautiful TUI with ANSI fallback
+└── Oracle Detection  # Global or npx fallback
 
 .apr/ (per-project configuration)
 ├── config.yaml           # Global settings
 ├── workflows/            # Workflow definitions
 │   └── <name>.yaml
-└── rounds/               # Round outputs
-    └── <workflow>/
-        └── round_N.md
+├── rounds/               # Round outputs
+│   └── <workflow>/
+│       └── round_N.md
+└── templates/            # Custom prompt templates
+
+~/.local/share/apr/ (user data)
+└── .last_update_check    # Daily update check timestamp
 ```
 
 ### File Locations
@@ -608,6 +1043,8 @@ apr (bash script, ~1700 LOC)
 | Path | Purpose |
 |------|---------|
 | `~/.local/bin/apr` | Main script (default install) |
+| `~/.local/share/apr/` | User data directory (XDG-compliant) |
+| `~/.cache/apr/` | Cache directory (XDG-compliant) |
 | `.apr/` | Per-project configuration directory |
 | `.apr/config.yaml` | Global APR config for this project |
 | `.apr/workflows/*.yaml` | Workflow definitions |
@@ -653,6 +1090,16 @@ APR uses [gum](https://github.com/charmbracelet/gum) for beautiful terminal outp
 | Non-TTY (piped) | Plain text |
 | CI environment (`$CI` set) | Plain text |
 | `APR_NO_GUM=1` | Force ANSI fallback |
+| `NO_COLOR=1` | Plain text (no colors) |
+
+### Accessibility
+
+APR respects the [NO_COLOR](https://no-color.org/) standard. When `NO_COLOR` is set (to any value), all colored output is disabled. This is useful for:
+
+- Screen readers and assistive technologies
+- Users with color vision deficiency
+- Piping output to files or other tools
+- Environments where ANSI codes cause issues
 
 ---
 
@@ -672,6 +1119,7 @@ APR uses [gum](https://github.com/charmbracelet/gum) for beautiful terminal outp
 | Package | Purpose |
 |---------|---------|
 | gum | Beautiful terminal UI |
+| jq | Required for robot mode JSON output |
 
 ### Install Dependencies
 
@@ -696,6 +1144,13 @@ sudo mkdir -p /etc/apt/keyrings
 curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
 echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
 sudo apt update && sudo apt install gum
+
+# jq (optional, for robot mode)
+# macOS
+brew install jq
+
+# Ubuntu/Debian
+sudo apt-get install jq
 ```
 
 ---
@@ -775,11 +1230,63 @@ apr setup  # Run the setup wizard
 
 </details>
 
+<details>
+<summary><strong>Robot mode returns "jq not found"</strong></summary>
+
+**Cause:** Robot mode requires `jq` for JSON formatting.
+
+**Fix:**
+```bash
+# macOS
+brew install jq
+
+# Ubuntu/Debian
+sudo apt-get install jq
+
+# Fedora
+sudo dnf install jq
+```
+
+</details>
+
+<details>
+<summary><strong>Update fails with checksum error</strong></summary>
+
+**Cause:** Download was corrupted or tampered with.
+
+**Fix:**
+```bash
+# Try again - network issues can cause incomplete downloads
+apr update
+
+# If it persists, reinstall from scratch
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/automated_plan_reviser_pro/main/install.sh" | bash
+```
+
+</details>
+
+<details>
+<summary><strong>Permission denied during update</strong></summary>
+
+**Cause:** APR is installed in a system directory requiring elevated privileges.
+
+**Fix:**
+APR automatically detects this and prompts for sudo. If it doesn't:
+```bash
+# Check where apr is installed
+which apr
+
+# If in /usr/local/bin, update will prompt for sudo
+# If that fails, manually update:
+sudo curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/automated_plan_reviser_pro/main/apr -o /usr/local/bin/apr
+sudo chmod +x /usr/local/bin/apr
+```
+
+</details>
+
 ---
 
-## 🤝 Contributing
-
-> *About Contributions:* I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Bug reports in particular are welcome.
+> *About Contributions:* Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
 
 ---
 
