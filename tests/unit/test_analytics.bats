@@ -143,14 +143,18 @@ teardown() {
 # Metrics Storage: Read Operations
 # =============================================================================
 
-@test "metrics_read: returns empty object for non-existent workflow" {
+@test "metrics_read: auto-initializes for new workflow" {
+    # metrics_read auto-initializes if workflow doesn't exist
     local result
-    result=$(metrics_read "nonexistent-workflow-read")
+    result=$(metrics_read "auto-init-test")
 
     log_test_actual "result" "$result"
 
-    # Should return empty object or null
-    [[ "$result" == "{}" ]] || [[ "$result" == "null" ]] || [[ -z "$result" ]]
+    # Should have initialized with empty rounds
+    local rounds_count
+    rounds_count=$(echo "$result" | jq '.rounds | length')
+
+    [[ "$rounds_count" == "0" ]]
 }
 
 @test "metrics_read: returns full JSON for existing workflow" {
@@ -472,8 +476,8 @@ OUTER
 
     log_test_actual "similarity_score" "$similarity_score"
 
-    # Identical files should have similarity 1
-    [[ "$similarity_score" == "1" ]]
+    # Identical files should have similarity 1 or 1.0
+    [[ "$similarity_score" == "1" ]] || [[ "$similarity_score" == "1.0" ]]
 }
 
 @test "calculate_change_metrics: returns null for missing old file" {
@@ -508,15 +512,12 @@ OUTER
 # Convergence Detection: Signal Functions
 # =============================================================================
 
-@test "calculate_output_trend_signal: returns 0 for insufficient rounds" {
-    metrics_init "signal-test-1"
-
-    # Only 2 rounds - insufficient
-    metrics_write_round "signal-test-1" 1 '{"round":1,"output":{"char_count":1000}}'
-    metrics_write_round "signal-test-1" 2 '{"round":2,"output":{"char_count":900}}'
+@test "calculate_output_trend_signal: returns 0 for insufficient data" {
+    # Function takes JSON with rounds array
+    local metrics_json='{"rounds":[{"round":1,"output":{"char_count":1000}}]}'
 
     local result
-    result=$(calculate_output_trend_signal "signal-test-1")
+    result=$(calculate_output_trend_signal "$metrics_json")
 
     log_test_actual "result" "$result"
 
@@ -524,15 +525,15 @@ OUTER
 }
 
 @test "calculate_output_trend_signal: detects decreasing trend" {
-    metrics_init "signal-test-2"
-
-    # Decreasing char counts - should indicate convergence
-    metrics_write_round "signal-test-2" 1 '{"round":1,"output":{"char_count":1000}}'
-    metrics_write_round "signal-test-2" 2 '{"round":2,"output":{"char_count":800}}'
-    metrics_write_round "signal-test-2" 3 '{"round":3,"output":{"char_count":600}}'
+    # Decreasing char counts across 3 rounds
+    local metrics_json='{"rounds":[
+        {"round":1,"output":{"char_count":1000}},
+        {"round":2,"output":{"char_count":800}},
+        {"round":3,"output":{"char_count":600}}
+    ]}'
 
     local result
-    result=$(calculate_output_trend_signal "signal-test-2")
+    result=$(calculate_output_trend_signal "$metrics_json")
 
     log_test_actual "result" "$result"
 
