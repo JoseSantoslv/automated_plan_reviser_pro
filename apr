@@ -2002,180 +2002,6 @@ update_convergence_metrics() {
     verbose "Convergence metrics updated"
 }
 
-# ---------------------------------------------------------------------------
-# Backfill Command (fzi.9)
-# ---------------------------------------------------------------------------
-
-backfill_workflow() {
-    local workflow="$1"
-    local force="${2:-false}"
-    local dry_run="${3:-false}"
-
-    local rounds_dir="$CONFIG_DIR/rounds/$workflow"
-    local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
-
-    verbose "Backfilling workflow: $workflow"
-    verbose "  rounds_dir: $rounds_dir"
-    verbose "  workflow_file: $workflow_file"
-    verbose "  force: $force, dry_run: $dry_run"
-
-    # Validate rounds directory exists
-    if [[ ! -d "$rounds_dir" ]]; then
-        print_error "No rounds found for workflow '$workflow'"
-        return 1
-    fi
-
-    # Validate workflow config exists
-    if [[ ! -f "$workflow_file" ]]; then
-        print_error "Workflow config not found: $workflow_file"
-        return 1
-    fi
-
-    # Check if metrics already exist
-    local metrics_path
-    metrics_path="$(metrics_dir "$workflow")/metrics.json"
-    if [[ -f "$metrics_path" ]] && [[ "$force" != "true" ]]; then
-        print_warning "Metrics already exist for '$workflow'"
-        print_info "Use --force to overwrite"
-        return 1
-    fi
-
-    if [[ "$dry_run" == "true" ]]; then
-        print_info "[DRY RUN] Would backfill workflow '$workflow'"
-    else
-        print_info "Backfilling metrics for workflow '$workflow'..."
-    fi
-
-    # Get sorted round files
-    local sorted_files=()
-    while IFS= read -r round_file; do
-        [[ -n "$round_file" ]] && sorted_files+=("$round_file")
-    done < <(find "$rounds_dir" -maxdepth 1 -name "round_*.md" -type f 2>/dev/null | sort -t_ -k2 -n)
-
-    if [[ ${#sorted_files[@]} -eq 0 ]]; then
-        print_warning "No round files found in $rounds_dir"
-        return 0
-    fi
-
-    verbose "Found ${#sorted_files[@]} round file(s)"
-
-    # Initialize metrics file (unless dry run)
-    if [[ "$dry_run" != "true" ]]; then
-        metrics_init "$workflow"
-    fi
-
-    local count=0
-    local prev_output=""
-
-    for round_file in "${sorted_files[@]}"; do
-        local round_num
-        round_num=$(basename "$round_file" .md | sed 's/round_//')
-
-        print_dim "  Analyzing round $round_num..."
-
-        if [[ "$dry_run" == "true" ]]; then
-            ((count++))
-            prev_output="$round_file"
-            continue
-        fi
-
-        # Collect output metrics
-        local output_metrics
-        output_metrics=$(collect_document_metrics "$round_file" "output")
-
-        # Get timestamp from file modification time (cross-platform)
-        local file_ts timestamp
-        file_ts=$(stat -c '%Y' "$round_file" 2>/dev/null || stat -f '%m' "$round_file" 2>/dev/null || echo "0")
-        timestamp=$(date -d "@$file_ts" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
-                   date -r "$file_ts" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
-                   echo "1970-01-01T00:00:00Z")
-
-        verbose "Round $round_num: timestamp=$timestamp"
-
-        # Calculate changes from previous (if exists)
-        local change_metrics="null"
-        if [[ -n "$prev_output" && -f "$prev_output" ]]; then
-            change_metrics=$(calculate_change_metrics "$prev_output" "$round_file")
-            verbose "Round $round_num: change_metrics computed"
-        fi
-
-        # Build round record (note: documents is null since we can't backfill input state)
-        local round_record
-        round_record=$(jq -nc \
-            --argjson round "$round_num" \
-            --arg timestamp "$timestamp" \
-            --argjson output "$output_metrics" \
-            --argjson changes "$change_metrics" \
-            '{
-                round: $round,
-                timestamp: $timestamp,
-                documents: null,
-                output: $output,
-                changes_from_previous: $changes,
-                backfilled: true
-            }')
-
-        metrics_write_round "$workflow" "$round_num" "$round_record"
-        verbose "Round $round_num: saved to metrics"
-
-        prev_output="$round_file"
-        ((count++))
-    done
-
-    if [[ "$dry_run" == "true" ]]; then
-        print_info "[DRY RUN] Would backfill $count round(s)"
-        return 0
-    fi
-
-    # Calculate convergence
-    verbose "Calculating convergence metrics..."
-    update_convergence_metrics "$workflow"
-
-    print_success "Backfilled $count round(s)"
-    print_success "Calculated convergence metrics"
-}
-
-backfill_all_workflows() {
-    local force="${1:-false}"
-    local dry_run="${2:-false}"
-
-    local workflow_dir="$CONFIG_DIR/workflows"
-    if [[ ! -d "$workflow_dir" ]]; then
-        print_error "No workflows configured"
-        return 1
-    fi
-
-    verbose "Backfilling all workflows in: $workflow_dir"
-
-    local count=0
-    for config in "$workflow_dir"/*.yaml; do
-        [[ -f "$config" ]] || continue
-        local name
-        name=$(basename "$config" .yaml)
-
-        verbose "Processing workflow: $name"
-        backfill_workflow "$name" "$force" "$dry_run" || true
-        ((count++))
-    done
-
-    print_success "Processed $count workflow(s)"
-}
-
-cmd_backfill() {
-    local workflow="${1:-$WORKFLOW}"
-    local all="${BACKFILL_ALL:-false}"
-    local force="${BACKFILL_FORCE:-false}"
-    local dry_run="${DRY_RUN:-false}"
-
-    verbose "cmd_backfill: workflow=$workflow all=$all force=$force dry_run=$dry_run"
-
-    if [[ "$all" == "true" ]]; then
-        backfill_all_workflows "$force" "$dry_run"
-    else
-        backfill_workflow "$workflow" "$force" "$dry_run"
-    fi
-}
-
 # -----------------------------------------------------------------------------
 # Interactive Setup Wizard
 # -----------------------------------------------------------------------------
@@ -3238,7 +3064,11 @@ safe_json_num() {
 generate_sparkline() {
     local values=("$@")
     local count=${#values[@]}
-    [[ $count -eq 0 ]] && return 0
+    if [[ $count -eq 0 ]]; then
+        verbose "generate_sparkline: no values"
+        return 0
+    fi
+    verbose "generate_sparkline: count=$count"
 
     local min=${values[0]}
     local max=${values[0]}
@@ -3250,6 +3080,7 @@ generate_sparkline() {
 
     local range=$((max - min))
     [[ $range -eq 0 ]] && range=1
+    verbose "generate_sparkline: min=$min max=$max range=$range"
 
     local chars="▁▂▃▄▅▆▇█"
     local sparkline=""
@@ -3264,7 +3095,9 @@ generate_sparkline() {
 get_trend_arrow() {
     local values=("$@")
     local count=${#values[@]}
+    verbose "get_trend_arrow: count=$count"
     if [[ $count -lt 2 ]]; then
+        verbose "get_trend_arrow: insufficient values, returning stable"
         echo "→"
         return 0
     fi
@@ -3283,6 +3116,7 @@ get_trend_arrow() {
     local second_count=$((count - half))
     [[ $second_count -lt 1 ]] && second_count=1
     local second_avg=$((second_sum / second_count))
+    verbose "get_trend_arrow: first_avg=$first_avg second_avg=$second_avg"
 
     if (( second_avg < first_avg * 80 / 100 )); then
         echo "↘"
@@ -3296,6 +3130,7 @@ get_trend_arrow() {
 get_convergence_indicator() {
     local confidence="${1:-0}"
     local indicator="◌"
+    verbose "get_convergence_indicator: confidence=$confidence"
 
     if command -v bc &>/dev/null; then
         if [[ $(echo "$confidence >= 0.90" | bc 2>/dev/null || echo 0) -eq 1 ]]; then
@@ -3307,6 +3142,7 @@ get_convergence_indicator() {
         fi
     fi
 
+    verbose "get_convergence_indicator: indicator=$indicator"
     echo "$indicator"
 }
 
@@ -3668,7 +3504,8 @@ show_stats() {
 # ---------------------------------------------------------------------------
 
 cmd_backfill() {
-    local workflow="${WORKFLOW:-default}"
+    local workflow_arg="${1:-}"
+    local workflow="${workflow_arg:-${WORKFLOW:-default}}"
     local force="${BACKFILL_FORCE:-false}"
     local dry_run="${DRY_RUN:-false}"
     local all="${BACKFILL_ALL:-false}"
@@ -3716,28 +3553,31 @@ backfill_workflow() {
 
     print_info "Backfilling metrics for workflow '$workflow'..."
 
-    local round_files=()
+    local round_entries=()
     local round_file
     for round_file in "$rounds_dir"/round_*.md; do
         [[ -f "$round_file" ]] || continue
-        round_files+=("$round_file")
+        local round_num
+        round_num=$(basename "$round_file" .md | sed 's/round_//')
+        [[ "$round_num" =~ ^[0-9]+$ ]] || continue
+        round_entries+=("${round_num}|${round_file}")
     done
 
-    if [[ ${#round_files[@]} -eq 0 ]]; then
+    if [[ ${#round_entries[@]} -eq 0 ]]; then
         print_warning "No round files found for workflow '$workflow'"
         return 0
     fi
 
-    local sorted_files=()
-    mapfile -t sorted_files < <(printf '%s\n' "${round_files[@]}" | sort -t_ -k2 -n)
+    local sorted_entries=()
+    mapfile -t sorted_entries < <(printf '%s\n' "${round_entries[@]}" | sort -n -t '|' -k1,1)
 
     local count=0
     local prev_output=""
 
-    for round_file in "${sorted_files[@]}"; do
-        local round_num
-        round_num=$(basename "$round_file" .md | sed 's/round_//')
-        [[ "$round_num" =~ ^[0-9]+$ ]] || continue
+    for entry in "${sorted_entries[@]}"; do
+        local round_num round_file
+        round_num=${entry%%|*}
+        round_file=${entry#*|}
 
         print_dim "  Analyzing round $round_num..."
 
@@ -3779,7 +3619,9 @@ backfill_workflow() {
                 backfilled: true
             }')
 
-        metrics_write_round "$workflow" "$round_num" "$round_record"
+        if ! metrics_write_round "$workflow" "$round_num" "$round_record"; then
+            print_warning "Failed to write metrics for round $round_num"
+        fi
 
         prev_output="$round_file"
         ((count++))
