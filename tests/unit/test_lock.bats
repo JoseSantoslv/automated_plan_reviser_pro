@@ -208,7 +208,9 @@ teardown() {
 }
 
 @test "cleanup_temp: safe when no temp directory" {
-    unset APR_TEMP_DIR
+    # Set to empty instead of unset (due to set -u in APR)
+    APR_TEMP_DIR=""
+    export APR_TEMP_DIR
 
     log_test_step "action" "Calling cleanup_temp without temp dir"
 

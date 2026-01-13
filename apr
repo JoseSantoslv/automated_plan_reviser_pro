@@ -56,6 +56,9 @@ set -euo pipefail
 
 VERSION="1.1.0"
 
+# Metrics schema (analytics)
+readonly METRICS_SCHEMA_VERSION="1.0.0"
+
 # GitHub repository info for updates
 readonly REPO_OWNER="Dicklesworthstone"
 readonly REPO_NAME="automated_plan_reviser_pro"
@@ -196,6 +199,11 @@ version_gt() {
 # Check if we can prompt the user (interactive terminal)
 can_prompt() {
     [[ -t 0 && -t 2 && "$QUIET_MODE" != "true" ]]
+}
+
+# ISO8601 timestamp (UTC)
+iso_timestamp() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
 # -----------------------------------------------------------------------------
@@ -930,7 +938,7 @@ get_config_value() {
                 line = $0
                 sub("^[[:space:]]*" key ":[[:space:]]*", "", line)
                 sub(/[[:space:]]*$/, "", line)
-                if (line !~ /^"/) {
+                if (line !~ /^["\047]/) {
                     sub(/[[:space:]]+#.*$/, "", line)
                     sub(/[[:space:]]*$/, "", line)
                 }
@@ -956,6 +964,10 @@ yaml_unquote() {
         value=${value%\"}
         value=${value//\\\"/\"}
         value=${value//\\\\/\\}
+    elif [[ "$value" == \'* && "$value" == *\' ]]; then
+        value=${value#\'}
+        value=${value%\'}
+        value=${value//"''"/"'"}
     fi
     printf '%s' "$value"
 }
@@ -1080,6 +1092,420 @@ with the git-diff style change versus the original plan shown below:
 "
 
     printf '%s\n' "$prompt"
+}
+
+# -----------------------------------------------------------------------------
+# Analytics Metrics Schema (fzi.1)
+#
+# Metrics JSON schema (stored at .apr/analytics/<workflow>/metrics.json):
+# {
+#   "schema_version": "1.0.0",
+#   "workflow": "default",
+#   "created_at": "2026-01-12T20:00:00Z",
+#   "updated_at": "2026-01-12T21:30:00Z",
+#   "rounds": [
+#     {
+#       "round": 1,
+#       "timestamp": "2026-01-12T20:00:00Z",
+#       "documents": {
+#         "readme": {
+#           "path": "README.md",
+#           "char_count": 5420,
+#           "word_count": 892,
+#           "line_count": 145,
+#           "heading_count": 12,
+#           "code_block_count": 5,
+#           "link_count": 8,
+#           "list_item_count": 23
+#         },
+#         "spec": { "...": "same metrics as readme" },
+#         "implementation": null
+#       },
+#       "output": {
+#         "path": ".apr/rounds/default/round_1.md",
+#         "char_count": 8500,
+#         "word_count": 1400,
+#         "line_count": 180
+#       },
+#       "changes_from_previous": null
+#     },
+#     {
+#       "round": 2,
+#       "timestamp": "2026-01-12T21:30:00Z",
+#       "documents": { "...": "same shape as round 1" },
+#       "output": { "...": "same shape as round 1" },
+#       "changes_from_previous": {
+#         "spec": {
+#           "lines_added": 45,
+#           "lines_deleted": 12,
+#           "lines_modified": 28,
+#           "diff_ratio": 0.265,
+#           "similarity_score": 0.82
+#         }
+#       }
+#     }
+#   ],
+#   "convergence": {
+#     "detected": false,
+#     "confidence": 0.0,
+#     "estimated_rounds_remaining": null,
+#     "signals": {
+#       "output_size_trend": "decreasing",
+#       "change_velocity": "decreasing",
+#       "similarity_trend": "increasing"
+#     }
+#   }
+# }
+#
+# Metric definitions:
+# - char_count: total characters in file
+# - word_count: total words in file
+# - line_count: total lines in file
+# - heading_count: markdown headings (#) count
+# - code_block_count: fenced code blocks (```) count
+# - link_count: markdown links count
+# - list_item_count: bullet/numbered list items count
+# - lines_added/lines_deleted/lines_modified: diff metrics between rounds
+# - diff_ratio: (lines_added + lines_deleted + lines_modified) / total_lines
+# - similarity_score: 0.0..1.0 similarity between rounds
+# -----------------------------------------------------------------------------
+
+metrics_dir() {
+    local workflow="$1"
+    echo "$CONFIG_DIR/analytics/$workflow"
+}
+
+metrics_file_path() {
+    local workflow="$1"
+    echo "$(metrics_dir "$workflow")/metrics.json"
+}
+
+metrics_default_json() {
+    local workflow="$1"
+    local ts
+    ts=$(iso_timestamp)
+    jq -nc \
+        --arg schema_version "$METRICS_SCHEMA_VERSION" \
+        --arg workflow "$workflow" \
+        --arg ts "$ts" \
+        '{
+            schema_version: $schema_version,
+            workflow: $workflow,
+            created_at: $ts,
+            updated_at: $ts,
+            rounds: [],
+            convergence: {
+                detected: false,
+                confidence: 0.0,
+                estimated_rounds_remaining: null,
+                signals: {}
+            }
+        }'
+}
+
+metrics_validate_json() {
+    local json_input="$1"
+    echo "$json_input" | jq -e \
+        '.schema_version and (.schema_version | type == "string")
+         and .workflow and (.workflow | type == "string")
+         and (.rounds | type == "array")
+         and (.convergence == null or (.convergence | type == "object"))' >/dev/null
+}
+
+metrics_migrate_json() {
+    local json_input="$1"
+    local workflow="${2:-}"
+    local version ts
+    version=$(echo "$json_input" | jq -r '.schema_version // empty' 2>/dev/null || echo "")
+    ts=$(iso_timestamp)
+
+    if [[ -n "$version" ]] && version_gt "$version" "$METRICS_SCHEMA_VERSION"; then
+        print_warning "Metrics schema version '$version' newer than supported '$METRICS_SCHEMA_VERSION'; leaving unchanged"
+        echo "$json_input"
+        return 0
+    fi
+
+    if [[ -n "$version" && "$version" == "$METRICS_SCHEMA_VERSION" ]]; then
+        if metrics_validate_json "$json_input"; then
+            echo "$json_input"
+            return 0
+        fi
+    fi
+
+    if [[ -z "$version" ]]; then
+        print_warning "Metrics schema_version missing; migrating to v${METRICS_SCHEMA_VERSION}"
+    elif [[ "$version" != "$METRICS_SCHEMA_VERSION" ]]; then
+        print_warning "Metrics schema version '$version' detected; migrating to v${METRICS_SCHEMA_VERSION}"
+    fi
+
+    # Normalize to latest schema while preserving unknown fields.
+    echo "$json_input" | jq -c \
+        --arg schema_version "$METRICS_SCHEMA_VERSION" \
+        --arg workflow "$workflow" \
+        --arg ts "$ts" \
+        '
+        .schema_version = $schema_version
+        | .workflow = (
+            if (.workflow // "") != "" then .workflow
+            elif ($workflow | length) > 0 then $workflow
+            else "unknown"
+            end
+          )
+        | .created_at = (.created_at // $ts)
+        | .updated_at = $ts
+        | .rounds = (.rounds // [])
+        | .convergence = (.convergence // {
+            detected: false,
+            confidence: 0.0,
+            estimated_rounds_remaining: null,
+            signals: {}
+          })
+        '
+}
+
+metrics_exists() {
+    local workflow="$1"
+    [[ -f "$(metrics_file_path "$workflow")" ]]
+}
+
+metrics_init() {
+    local workflow="$1"
+    local metrics_path
+    metrics_path=$(metrics_file_path "$workflow")
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for analytics metrics"
+        return 1
+    fi
+
+    if [[ -f "$metrics_path" ]]; then
+        verbose "metrics_init: metrics file exists for workflow '$workflow'"
+        metrics_migrate "$workflow" || return 1
+        return 0
+    fi
+
+    verbose "metrics_init: creating metrics file for workflow '$workflow'"
+    mkdir -p "$(metrics_dir "$workflow")"
+
+    local json
+    json=$(metrics_default_json "$workflow") || {
+        print_error "Failed to build metrics JSON"
+        return 1
+    }
+
+    metrics_write_atomic "$workflow" "$json"
+}
+
+# Backwards-compatible alias
+metrics_init_file() {
+    metrics_init "$@"
+}
+
+metrics_read() {
+    local workflow="$1"
+    local metrics_path
+    metrics_path=$(metrics_file_path "$workflow")
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for analytics metrics"
+        return 1
+    fi
+
+    metrics_init "$workflow" || return 1
+
+    local json
+    json=$(cat "$metrics_path")
+    if ! metrics_validate_json "$json"; then
+        print_error "Metrics file failed schema validation"
+        return 1
+    fi
+    printf '%s\n' "$json"
+}
+
+metrics_validate() {
+    local workflow="$1"
+    local metrics_path
+    metrics_path=$(metrics_file_path "$workflow")
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for analytics metrics"
+        return 1
+    fi
+
+    if [[ ! -f "$metrics_path" ]]; then
+        print_error "Metrics file not found for workflow '$workflow'"
+        return 1
+    fi
+
+    local json
+    json=$(cat "$metrics_path")
+    if ! metrics_validate_json "$json"; then
+        print_error "Metrics file failed schema validation"
+        return 1
+    fi
+    return 0
+}
+
+metrics_migrate() {
+    local workflow="$1"
+    local metrics_path
+    metrics_path=$(metrics_file_path "$workflow")
+
+    if [[ ! -f "$metrics_path" ]]; then
+        return 0
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for analytics metrics"
+        return 1
+    fi
+
+    local current_json current_version
+    current_json=$(cat "$metrics_path")
+    current_version=$(echo "$current_json" | jq -r '.schema_version // empty' 2>/dev/null || echo "")
+
+    if [[ -n "$current_version" ]] && version_gt "$current_version" "$METRICS_SCHEMA_VERSION"; then
+        print_warning "Metrics schema version '$current_version' newer than supported '$METRICS_SCHEMA_VERSION'; skipping migration"
+        return 0
+    fi
+
+    if [[ -n "$current_version" && "$current_version" == "$METRICS_SCHEMA_VERSION" ]]; then
+        return 0
+    fi
+
+    local backup_path
+    backup_path="${metrics_path}.backup.$(date -u +%Y%m%d_%H%M%S)"
+    cp "$metrics_path" "$backup_path"
+    verbose "metrics_migrate: backup created at $backup_path"
+
+    local migrated_json
+    migrated_json=$(metrics_migrate_json "$current_json" "$workflow") || {
+        print_error "Metrics migration failed"
+        return 1
+    }
+
+    metrics_write_atomic "$workflow" "$migrated_json"
+}
+
+metrics_read_round() {
+    local workflow="$1"
+    local round_num="$2"
+
+    verbose "metrics_read_round: workflow=$workflow round=$round_num"
+
+    local json
+    json=$(metrics_read "$workflow") || return 1
+
+    echo "$json" | jq -c --argjson round "$round_num" \
+        '(.rounds | map(select(.round == $round)) | .[0]) // null'
+}
+
+metrics_write_round() {
+    local workflow="$1"
+    local round_num="$2"
+    local round_json="$3"
+    local metrics_path
+    metrics_path=$(metrics_file_path "$workflow")
+
+    verbose "metrics_write_round: workflow=$workflow round=$round_num"
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for analytics metrics"
+        return 1
+    fi
+
+    metrics_init "$workflow" || return 1
+
+    if ! echo "$round_json" | jq -e '.' >/dev/null 2>&1; then
+        print_error "Round metrics JSON is invalid"
+        return 1
+    fi
+
+    local ts normalized_round merged
+    ts=$(iso_timestamp)
+    normalized_round=$(echo "$round_json" | jq -c --argjson num "$round_num" '.round = $num')
+
+    merged=$(jq -c \
+        --argjson round "$normalized_round" \
+        --argjson num "$round_num" \
+        --arg ts "$ts" \
+        '
+        .rounds |= (map(select(.round != $num)) + [$round] | sort_by(.round))
+        | .updated_at = $ts
+        ' "$metrics_path") || {
+        print_error "Failed to write round metrics"
+        return 1
+    }
+
+    metrics_write_atomic "$workflow" "$merged"
+    verbose "metrics_write_round: wrote round $round_num for workflow '$workflow'"
+}
+
+metrics_write_convergence() {
+    local workflow="$1"
+    local convergence_json="$2"
+    local metrics_path
+    metrics_path=$(metrics_file_path "$workflow")
+
+    verbose "metrics_write_convergence: workflow=$workflow"
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for analytics metrics"
+        return 1
+    fi
+
+    metrics_init "$workflow" || return 1
+
+    if ! echo "$convergence_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        print_error "Convergence JSON must be an object"
+        return 1
+    fi
+
+    local ts merged
+    ts=$(iso_timestamp)
+    merged=$(jq -c \
+        --argjson convergence "$convergence_json" \
+        --arg ts "$ts" \
+        '
+        .convergence = $convergence
+        | .updated_at = $ts
+        ' "$metrics_path") || {
+        print_error "Failed to write convergence metrics"
+        return 1
+    }
+
+    metrics_write_atomic "$workflow" "$merged"
+    verbose "metrics_write_convergence: updated convergence for workflow '$workflow'"
+}
+
+metrics_write_atomic() {
+    local workflow="$1"
+    local json_input="$2"
+    local metrics_path
+    metrics_path=$(metrics_file_path "$workflow")
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for analytics metrics"
+        return 1
+    fi
+
+    if ! metrics_validate_json "$json_input"; then
+        print_error "Refusing to write invalid metrics JSON"
+        return 1
+    fi
+
+    mkdir -p "$(metrics_dir "$workflow")"
+
+    local tmp_file=""
+    tmp_file=$(mktemp 2>/dev/null || mktemp -t apr_metrics 2>/dev/null || echo "")
+    if [[ -z "$tmp_file" ]]; then
+        print_error "Failed to create temporary file for metrics"
+        return 1
+    fi
+
+    printf '%s\n' "$json_input" > "$tmp_file"
+    mv "$tmp_file" "$metrics_path"
+    verbose "Wrote metrics to $metrics_path"
 }
 
 # -----------------------------------------------------------------------------
@@ -2158,11 +2584,6 @@ show_stats() {
 # shellcheck disable=SC2034  # State flag for helper functions
 ROBOT_MODE=false
 ROBOT_COMPACT=false
-
-# ISO8601 timestamp
-iso_timestamp() {
-    date -u +"%Y-%m-%dT%H:%M:%SZ"
-}
 
 # Build JSON response using jq (required for robot mode)
 # Usage: robot_json ok|false code data_json [hint]

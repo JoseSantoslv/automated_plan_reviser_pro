@@ -190,14 +190,17 @@ teardown() {
     [[ "$CAPTURED_STDERR" == *"Error should appear"* ]]
 }
 
-@test "print_warning: suppressed in QUIET_MODE" {
+@test "print_warning: NOT suppressed in QUIET_MODE (like errors)" {
+    # Warnings are always shown, like errors - they're important
     export QUIET_MODE=true
 
-    capture_streams print_warning "Should not appear"
+    capture_streams print_warning "Warning should appear"
 
     log_test_actual "stderr" "$CAPTURED_STDERR"
 
-    [[ -z "$CAPTURED_STDERR" ]]
+    # Warnings are NOT suppressed (important information)
+    [[ -n "$CAPTURED_STDERR" ]]
+    [[ "$CAPTURED_STDERR" == *"Warning should appear"* ]]
 }
 
 @test "print_info: suppressed in QUIET_MODE" {
