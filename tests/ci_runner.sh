@@ -166,7 +166,7 @@ run_tests() {
     local exit_code=0
     "$BATS_BIN" "${bats_opts[@]}" "${test_files[@]}" 2>&1 | tee "$TAP_FILE" || exit_code=$?
 
-    return $exit_code
+    return "$exit_code"
 }
 
 # =============================================================================
@@ -218,7 +218,7 @@ summarize() {
         fi
     fi
 
-    return $exit_code
+    return "$exit_code"
 }
 
 # =============================================================================

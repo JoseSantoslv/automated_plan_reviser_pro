@@ -119,10 +119,25 @@ ORACLE_CMD=()
 # Temp directory for cleanup on exit
 APR_TEMP_DIR=""
 
+# Dashboard state (best-effort terminal restoration on exit)
+DASHBOARD_ACTIVE=false
+
 # Cleanup function for trap
 cleanup_temp() {
     # Release any held lock
     release_lock 2>/dev/null || true
+
+    # Restore terminal state if we were in the interactive dashboard
+    if [[ "${DASHBOARD_ACTIVE:-false}" == "true" && -t 2 ]]; then
+        if declare -F dashboard_show_cursor >/dev/null; then
+            dashboard_show_cursor 2>/dev/null || true
+        fi
+        if declare -F dashboard_clear >/dev/null; then
+            dashboard_clear 2>/dev/null || true
+        fi
+        DASHBOARD_ACTIVE=false
+    fi
+
     # Remove temp directory
     if [[ -n "$APR_TEMP_DIR" && -d "$APR_TEMP_DIR" ]]; then
         rm -rf -- "$APR_TEMP_DIR"
@@ -1563,11 +1578,13 @@ metrics_write_atomic() {
 
     if ! printf '%s\n' "$json_input" > "$tmp_file"; then
         print_error "Failed to write metrics temp file"
+        rm -f "$tmp_file" 2>/dev/null
         return 1
     fi
 
     if ! mv -f "$tmp_file" "$metrics_path"; then
         print_error "Failed to move metrics temp file into place"
+        rm -f "$tmp_file" 2>/dev/null
         return 1
     fi
     verbose "Wrote metrics to $metrics_path"
@@ -3001,6 +3018,13 @@ diff_rounds() {
     else
         round_old="$arg1"
         round_new="$arg2"
+        # Normalize: ensure round_old < round_new for intuitive diff order
+        if [[ "$round_old" -gt "$round_new" ]]; then
+            local tmp="$round_old"
+            round_old="$round_new"
+            round_new="$tmp"
+            verbose "Normalized round order: old=$round_old new=$round_new"
+        fi
     fi
 
     local file_old="$rounds_dir/round_${round_old}.md"
@@ -4070,8 +4094,15 @@ dashboard_render_bar_chart() {
     done
     printf "  " >&2
     local i
-    for ((i=1; i<=count; i++)); do
-        printf "R%-2d" "$i" >&2
+    for ((i=0; i<count; i++)); do
+        local label="R$((i+1))"
+        # Check if DASHBOARD_ROUND_NUMS is set (safe for set -u)
+        if [[ -n "${DASHBOARD_ROUND_NUMS[*]+_}" ]]; then
+            if [[ ${#DASHBOARD_ROUND_NUMS[@]} -eq count ]]; then
+                label="R${DASHBOARD_ROUND_NUMS[$i]}"
+            fi
+        fi
+        printf "%-3s" "$label" >&2
     done
     printf "\n\n" >&2
 }
@@ -4155,14 +4186,16 @@ dashboard_show_round_detail() {
 }
 
 dashboard_handle_input() {
-    local key rest
-    read -rsn1 key </dev/tty
+    local key="" rest=""
+    read -rsn1 key </dev/tty || true
     case "$key" in
         $'\x1b')
-            read -rsn2 rest </dev/tty
+            # Add timeout to differentiate ESC from arrow keys
+            read -rsn2 -t 0.1 rest </dev/tty || rest=""
             case "$rest" in
                 '[A') echo "up" ;;
                 '[B') echo "down" ;;
+                *) echo "quit" ;; # Plain ESC quits
             esac
             ;;
         q|Q) echo "quit" ;;
@@ -4225,8 +4258,8 @@ show_dashboard() {
     local selected=0
     local metrics
 
+    DASHBOARD_ACTIVE=true
     dashboard_hide_cursor
-    trap 'dashboard_show_cursor; dashboard_clear' EXIT
 
     while true; do
         read -r cols rows < <(dashboard_term_size)
@@ -4256,12 +4289,12 @@ show_dashboard() {
         dashboard_render "$workflow" "$metrics" "$selected"
 
         case "$(dashboard_handle_input)" in
-            up) ((selected--)) ;;
-            down) ((selected++)) ;;
+            up) ((selected--)) || true ;;
+            down) ((selected++)) || true ;;
             diff)
                 if (( selected >= 1 )); then
                     dashboard_clear
-                    diff_rounds "${DASHBOARD_ROUND_NUMS[$selected]}" "${DASHBOARD_ROUND_NUMS[$((selected - 1))]}"
+                    diff_rounds "${DASHBOARD_ROUND_NUMS[$((selected - 1))]}" "${DASHBOARD_ROUND_NUMS[$selected]}"
                     print_dim "Press any key to return..." >&2
                     read -rsn1 _ </dev/tty
                 else
@@ -4283,6 +4316,10 @@ show_dashboard() {
                 ;;
         esac
     done
+
+    dashboard_show_cursor
+    dashboard_clear
+    DASHBOARD_ACTIVE=false
 }
 
 # ---------------------------------------------------------------------------
