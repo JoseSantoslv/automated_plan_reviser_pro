@@ -2507,11 +2507,23 @@ robot_history() {
         return 1
     fi
 
-    local rounds=()
+    local round_entries=()
     for round_file in "$rounds_dir"/round_*.md; do
         [[ -f "$round_file" ]] || continue
-        local round_num size mod_ts
+        local round_num
         round_num=$(basename "$round_file" .md | sed 's/round_//')
+        [[ "$round_num" =~ ^[0-9]+$ ]] || continue
+        round_entries+=("${round_num}|${round_file}")
+    done
+
+    local sorted_entries=()
+    mapfile -t sorted_entries < <(printf '%s\n' "${round_entries[@]}" | sort -n -t '|' -k1,1)
+
+    local rounds=()
+    for entry in "${sorted_entries[@]}"; do
+        local round_num round_file size mod_ts
+        round_num=${entry%%|*}
+        round_file=${entry#*|}
         size=$(stat -c '%s' "$round_file" 2>/dev/null || stat -f '%z' "$round_file" 2>/dev/null || echo "0")
         mod_ts=$(stat -c '%Y' "$round_file" 2>/dev/null || stat -f '%m' "$round_file" 2>/dev/null || echo "0")
 
