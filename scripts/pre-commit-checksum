@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# pre-commit hook: Verify checksums are up to date before commit
+#
+# Install: cp scripts/pre-commit-checksum .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Or:      ln -sf ../../scripts/pre-commit-checksum .git/hooks/pre-commit
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Check if apr or install.sh are staged for commit
+staged_files=$(git diff --cached --name-only)
+
+if ! echo "$staged_files" | grep -qE '^(apr|install\.sh)$'; then
+    # No script changes staged, nothing to check
+    exit 0
+fi
+
+echo -e "${YELLOW}[pre-commit] Checking checksums for apr/install.sh changes...${NC}"
+
+# Calculate current checksums of staged versions
+apr_staged_hash=""
+install_staged_hash=""
+
+if echo "$staged_files" | grep -q '^apr$'; then
+    apr_staged_hash=$(git show :apr | sha256sum | awk '{print $1}')
+fi
+
+if echo "$staged_files" | grep -q '^install.sh$'; then
+    install_staged_hash=$(git show :install.sh | sha256sum | awk '{print $1}')
+fi
+
+# Check if checksum files are also staged
+needs_update=false
+checksum_files_staged=false
+
+if echo "$staged_files" | grep -qE '^(apr\.sha256|install\.sh\.sha256|checksums\.txt|CHECKSUMS\.sha256)$'; then
+    checksum_files_staged=true
+fi
+
+# Verify apr checksum
+if [[ -n "$apr_staged_hash" ]]; then
+    if echo "$staged_files" | grep -q '^apr.sha256$'; then
+        stored_hash=$(git show :apr.sha256 | awk '{print $1}' | tr -d '[:space:]')
+    else
+        stored_hash=$(cat apr.sha256 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo "")
+    fi
+
+    if [[ "$apr_staged_hash" != "$stored_hash" ]]; then
+        echo -e "${RED}[pre-commit] ERROR: apr.sha256 is out of date!${NC}"
+        echo "  Expected: $apr_staged_hash"
+        echo "  Got:      $stored_hash"
+        needs_update=true
+    fi
+fi
+
+# Verify install.sh checksum
+if [[ -n "$install_staged_hash" ]]; then
+    if echo "$staged_files" | grep -q '^install.sh.sha256$'; then
+        stored_hash=$(git show :install.sh.sha256 | awk '{print $1}' | tr -d '[:space:]')
+    else
+        stored_hash=$(cat install.sh.sha256 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo "")
+    fi
+
+    if [[ "$install_staged_hash" != "$stored_hash" ]]; then
+        echo -e "${RED}[pre-commit] ERROR: install.sh.sha256 is out of date!${NC}"
+        echo "  Expected: $install_staged_hash"
+        echo "  Got:      $stored_hash"
+        needs_update=true
+    fi
+fi
+
+if $needs_update; then
+    echo ""
+    echo -e "${YELLOW}Run the following to update checksums:${NC}"
+    echo ""
+    echo "  sha256sum apr | awk '{print \$1}' > apr.sha256"
+    echo "  sha256sum install.sh | awk '{print \$1}' > install.sh.sha256"
+    echo "  sha256sum apr install.sh > checksums.txt"
+    echo "  sha256sum apr install.sh > CHECKSUMS.sha256"
+    echo "  git add apr.sha256 install.sh.sha256 checksums.txt CHECKSUMS.sha256"
+    echo ""
+    echo "Or run: make update-checksums"
+    echo ""
+    exit 1
+fi
+
+echo -e "${GREEN}[pre-commit] Checksums OK${NC}"
+exit 0
