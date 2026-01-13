@@ -3334,6 +3334,187 @@ show_stats_full() {
     print_info "$confidence_msg"
 }
 
+metrics_filter_for_export() {
+    local metrics="$1"
+    local rounds_spec="${2:-}"
+    local since="${3:-}"
+    local filtered="$metrics"
+
+    if [[ -n "$rounds_spec" ]]; then
+        if [[ "$rounds_spec" =~ ^[0-9]+-[0-9]+$ ]]; then
+            local start end
+            start=${rounds_spec%-*}
+            end=${rounds_spec#*-}
+            if (( start > end )); then
+                print_error "Invalid --rounds range: start greater than end"
+                return 1
+            fi
+            filtered=$(echo "$filtered" | jq --argjson start "$start" --argjson end "$end" \
+                '.rounds |= map(select(.round >= $start and .round <= $end))')
+        elif [[ "$rounds_spec" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            local rounds_list_json
+            IFS=',' read -r -a rounds_list <<< "$rounds_spec"
+            rounds_list_json=$(printf '%s\n' "${rounds_list[@]}" | jq -Rsc 'split("\n") | map(select(length>0)) | map(tonumber)')
+            filtered=$(echo "$filtered" | jq --argjson list "$rounds_list_json" \
+                '.rounds |= map(select(.round as $r | $list | index($r)))')
+        else
+            print_error "Invalid --rounds format: $rounds_spec"
+            print_info "Use N-M or comma-separated list (e.g. 1,3,5)"
+            return 1
+        fi
+    fi
+
+    if [[ -n "$since" ]]; then
+        filtered=$(echo "$filtered" | jq --arg since "$since" \
+            '.rounds |= map(select(.timestamp != null and .timestamp >= $since))')
+    fi
+
+    printf '%s\n' "$filtered"
+}
+
+export_json() {
+    local metrics="$1"
+    local output_file="${2:-}"
+
+    if [[ -n "$output_file" ]]; then
+        echo "$metrics" | jq '.' > "$output_file"
+        print_success "Exported JSON to: $output_file"
+    else
+        echo "$metrics" | jq '.'
+    fi
+}
+
+export_csv() {
+    local metrics="$1"
+    local output_file="${2:-}"
+
+    local csv_output
+    csv_output=$(echo "$metrics" | jq -r '
+        (.convergence.confidence // "") as $conv
+        | (["round","timestamp","output_chars","output_words","output_lines","lines_added","lines_deleted","similarity","convergence_score"] | @csv),
+          (.rounds[] | [
+              .round,
+              .timestamp,
+              (.output.char_count // ""),
+              (.output.word_count // ""),
+              (.output.line_count // ""),
+              (.changes_from_previous.lines_added // ""),
+              (.changes_from_previous.lines_deleted // ""),
+              (.changes_from_previous.similarity_score // ""),
+              $conv
+          ] | @csv)
+    ')
+
+    if [[ -n "$output_file" ]]; then
+        printf '%s\n' "$csv_output" > "$output_file"
+        print_success "Exported CSV to: $output_file"
+    else
+        printf '%s\n' "$csv_output"
+    fi
+}
+
+export_markdown() {
+    local metrics="$1"
+    local output_file="${2:-}"
+
+    local workflow round_count convergence avg_size avg_human generated
+    workflow=$(echo "$metrics" | jq -r '.workflow // "default"' 2>/dev/null || echo "default")
+    round_count=$(echo "$metrics" | jq -r '.rounds | length' 2>/dev/null || echo "0")
+    convergence=$(echo "$metrics" | jq -r '.convergence.confidence // 0' 2>/dev/null || echo "0")
+    avg_size=$(echo "$metrics" | jq -r '[.rounds[].output.char_count // 0] | if length > 0 then (add / length | floor) else 0 end' 2>/dev/null || echo "0")
+    if [[ -z "$convergence" || "$convergence" == "null" ]]; then
+        convergence=0
+    fi
+    if [[ ! "$avg_size" =~ ^[0-9]+$ ]]; then
+        avg_size=0
+    fi
+    avg_human=$(format_bytes "$avg_size")
+    generated=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")
+
+    local convergence_pct
+    convergence_pct=$(awk -v c="$convergence" 'BEGIN { printf "%.0f", c * 100 }')
+
+    local rounds_md
+    rounds_md=$(echo "$metrics" | jq -r '
+        .rounds | sort_by(.round) | .[] |
+        "### Round \(.round) - \(.timestamp // "N/A")\n" +
+        "- Output: \(.output.char_count // "N/A") chars, \(.output.line_count // "N/A") lines\n" +
+        (if .changes_from_previous == null then
+            "- Changes: N/A\n- Similarity: N/A\n"
+         else
+            "- Changes: +\(.changes_from_previous.lines_added // "-") / -\(.changes_from_previous.lines_deleted // "-")\n" +
+            "- Similarity: \((.changes_from_previous.similarity_score // 0) * 100 | floor)%\n"
+         end) + "\n"
+    ')
+
+    local md_output
+    md_output=$(cat <<EOF
+# APR Metrics Report: $workflow
+
+Generated: $generated
+
+## Summary
+
+| Metric | Value |
+|--------|-------|
+| Total Rounds | $round_count |
+| Convergence | ${convergence_pct}% |
+| Average Output Size | $avg_human |
+
+## Round Details
+
+$rounds_md
+EOF
+)
+
+    if [[ -n "$output_file" ]]; then
+        printf '%s\n' "$md_output" > "$output_file"
+        print_success "Exported Markdown to: $output_file"
+    else
+        printf '%s\n' "$md_output"
+    fi
+}
+
+export_metrics() {
+    local workflow="$1"
+    local format="${2:-json}"
+    local output_file="${3:-}"
+    local rounds_spec="${4:-}"
+    local since="${5:-}"
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for metrics export"
+        return 1
+    fi
+
+    if ! metrics_exists "$workflow"; then
+        print_error "No metrics available for workflow '$workflow'"
+        print_info "Run 'apr backfill' to generate metrics from existing rounds"
+        return 1
+    fi
+
+    local metrics
+    metrics=$(metrics_read "$workflow") || return 1
+    metrics=$(metrics_filter_for_export "$metrics" "$rounds_spec" "$since") || return 1
+
+    case "$format" in
+        json)
+            export_json "$metrics" "$output_file"
+            ;;
+        csv)
+            export_csv "$metrics" "$output_file"
+            ;;
+        md|markdown)
+            export_markdown "$metrics" "$output_file"
+            ;;
+        *)
+            print_error "Unknown export format: $format"
+            print_info "Supported formats: json, csv, md"
+            return 1
+            ;;
+    esac
+}
+
 show_stats() {
     local workflow="${WORKFLOW:-default}"
 
@@ -3345,6 +3526,11 @@ show_stats() {
         print_error "Workflow '$workflow' not found"
         print_info "Run 'apr list' to see available workflows"
         exit $EXIT_CONFIG_ERROR
+    fi
+
+    if [[ -n "${EXPORT_FORMAT:-}" ]]; then
+        export_metrics "$workflow" "$EXPORT_FORMAT" "$INTEGRATE_OUTPUT" "$EXPORT_ROUNDS" "$EXPORT_SINCE"
+        return $?
     fi
 
     if [[ "$STATS_JSON" == "true" ]]; then
@@ -4285,7 +4471,7 @@ show_help() {
         gum style --faint "  -d, --dry-run        Preview without sending to GPT Pro" >&2
         gum style --faint "  -r, --render         Render bundle for manual paste" >&2
         gum style --faint "  -c, --copy           Copy rendered bundle to clipboard" >&2
-        gum style --faint "  -o, --output FILE    Output to file (integrate command)" >&2
+        gum style --faint "  -o, --output FILE    Output to file (integrate/export)" >&2
         gum style --faint "  --wait               Wait for completion (blocking)" >&2
         gum style --faint "  --login              Manual login mode (first-time setup)" >&2
         gum style --faint "  --keep-browser       Keep browser open after completion" >&2
@@ -4294,6 +4480,9 @@ show_help() {
         gum style --faint "  --hours NUM          Status window in hours (default: 72)" >&2
         gum style --faint "  --detailed           Show detailed metrics in stats" >&2
         gum style --faint "  --json               Output stats as raw JSON" >&2
+        gum style --faint "  --export FORMAT      Export stats (json, csv, md)" >&2
+        gum style --faint "  --rounds RANGE       Filter export rounds (e.g. 3-5 or 1,3,5)" >&2
+        gum style --faint "  --since ISO_DATE     Filter export rounds since timestamp" >&2
         gum style --faint "  --all                Backfill all workflows" >&2
         gum style --faint "  --force              Overwrite existing metrics" >&2
         gum style --faint "  -v, --verbose        Show detailed debug output" >&2
@@ -4387,7 +4576,7 @@ show_help() {
         echo "  -d, --dry-run        Preview without sending to GPT Pro" >&2
         echo "  -r, --render         Render bundle for manual paste" >&2
         echo "  -c, --copy           Copy rendered bundle to clipboard" >&2
-        echo "  -o, --output FILE    Output to file (integrate command)" >&2
+        echo "  -o, --output FILE    Output to file (integrate/export)" >&2
         echo "  --wait               Wait for completion (blocking)" >&2
         echo "  --login              Manual login mode (first-time setup)" >&2
         echo "  --keep-browser       Keep browser open after completion" >&2
@@ -4396,6 +4585,9 @@ show_help() {
         echo "  --hours NUM          Status window in hours (default: 72)" >&2
         echo "  --detailed           Show detailed metrics in stats" >&2
         echo "  --json               Output stats as raw JSON" >&2
+        echo "  --export FORMAT      Export stats (json, csv, md)" >&2
+        echo "  --rounds RANGE       Filter export rounds (e.g. 3-5 or 1,3,5)" >&2
+        echo "  --since ISO_DATE     Filter export rounds since timestamp" >&2
         echo "  --all                Backfill all workflows" >&2
         echo "  --force              Overwrite existing metrics" >&2
         echo "  -v, --verbose        Show detailed debug output" >&2
@@ -4506,6 +4698,9 @@ main() {
     STATUS_HOURS="${APR_STATUS_HOURS:-72}"
     STATS_DETAILED=false
     STATS_JSON=false
+    EXPORT_FORMAT=""
+    EXPORT_ROUNDS=""
+    EXPORT_SINCE=""
     BACKFILL_ALL=false
     BACKFILL_FORCE=false
 
@@ -4584,6 +4779,30 @@ main() {
             --json)
                 STATS_JSON=true
                 shift
+                ;;
+            --export)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then
+                    print_error "Option --export requires a format (json, csv, md)"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                EXPORT_FORMAT="$2"
+                shift 2
+                ;;
+            --rounds)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then
+                    print_error "Option --rounds requires a value (e.g. 3-5 or 1,3,5)"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                EXPORT_ROUNDS="$2"
+                shift 2
+                ;;
+            --since)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then
+                    print_error "Option --since requires an ISO date"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                EXPORT_SINCE="$2"
+                shift 2
                 ;;
             --all)
                 BACKFILL_ALL=true
