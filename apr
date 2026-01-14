@@ -52,6 +52,13 @@
 #   APR_NO_GUM         Disable gum even if available
 #   NO_COLOR           Disable colors (accessibility)
 #
+#   Oracle Stability Thresholds (prevent truncation with GPT Pro Extended Thinking):
+#   APR_ORACLE_MIN_STABLE_MS     Min stability time for normal answers (default: 30000ms)
+#   APR_ORACLE_SHORT_STABLE_MS   Min stability time for short answers (default: 15000ms)
+#   APR_ORACLE_SETTLE_WINDOW_MS  Settle window for completion detection (default: 30000ms)
+#   APR_ORACLE_STABLE_CYCLES     Required stable polling cycles (default: 12)
+#   APR_NO_ORACLE_PATCH          Disable Oracle patching (set to 1)
+#
 # More info: https://github.com/Dicklesworthstone/automated_plan_reviser_pro
 
 set -euo pipefail
@@ -119,6 +126,15 @@ ORACLE_CMD=()
 # Oracle feature detection (best-effort, set during preflight and other entrypoints)
 ORACLE_SUPPORTS_NOTIFY=false
 ORACLE_FEATURES_DETECTED=false
+
+# Oracle stability thresholds (monkey-patch prevention for GPT Pro Extended Thinking truncation)
+# GPT Pro can pause 10-30+ seconds during thinking, which Oracle misinterprets as completion.
+# These thresholds are patched into Oracle's assistantResponse.js at runtime.
+APR_ORACLE_MIN_STABLE_MS="${APR_ORACLE_MIN_STABLE_MS:-30000}"      # Min stable time for normal answers (default: 30s)
+APR_ORACLE_SHORT_STABLE_MS="${APR_ORACLE_SHORT_STABLE_MS:-15000}"  # Min stable time for short answers (default: 15s)
+APR_ORACLE_SETTLE_WINDOW_MS="${APR_ORACLE_SETTLE_WINDOW_MS:-30000}" # Settle window for normal answers (default: 30s)
+APR_ORACLE_STABLE_CYCLES="${APR_ORACLE_STABLE_CYCLES:-12}"         # Required stable cycles for normal (default: 12)
+APR_ORACLE_PATCHED=false                                           # Track if we've patched Oracle this session
 
 # Temp directory for cleanup on exit
 APR_TEMP_DIR=""
@@ -608,6 +624,172 @@ oracle_detect_features() {
 }
 
 # -----------------------------------------------------------------------------
+# Oracle Stability Threshold Patching (GPT Pro Extended Thinking Fix)
+# -----------------------------------------------------------------------------
+# Oracle's browser automation detects "completion" when the response text stops
+# changing. However, GPT Pro Extended Thinking can pause for 10-30+ seconds
+# during its reasoning phase, which Oracle misinterprets as completion.
+#
+# This function patches Oracle's assistantResponse.js to use configurable
+# stability thresholds that tolerate GPT Pro's thinking pauses.
+#
+# Original values (cause truncation):
+#   minStableMs: 1200ms (normal), 8000ms (short)
+#   settleWindowMs: 5000ms (normal), 12000ms (short)
+#   stableCycles: 6 (normal), 12 (short)
+#
+# Patched values (configured via APR_ORACLE_* env vars):
+#   minStableMs: 30000ms (normal), 15000ms (short)
+#   settleWindowMs: 30000ms (normal), 15000ms (short)
+#   stableCycles: 12 (normal), 18 (short)
+
+ORACLE_ASSISTANT_RESPONSE_PATH=""
+ORACLE_BACKUP_PATH=""
+
+find_oracle_assistant_response() {
+    # Find Oracle's assistantResponse.js in the npm installation
+    local oracle_path=""
+
+    # Try to find oracle binary location
+    if command -v oracle &>/dev/null; then
+        oracle_path=$(command -v oracle)
+        # Resolve symlinks to find actual installation
+        if [[ -L "$oracle_path" ]]; then
+            oracle_path=$(readlink -f "$oracle_path" 2>/dev/null || realpath "$oracle_path" 2>/dev/null)
+        fi
+    fi
+
+    # Find the node_modules root
+    local node_modules=""
+    if [[ -n "$oracle_path" ]]; then
+        # Navigate from bin/oracle to lib/node_modules/@steipete/oracle
+        local bin_dir
+        bin_dir=$(dirname "$oracle_path")
+        local prefix_dir
+        prefix_dir=$(dirname "$bin_dir")
+        node_modules="$prefix_dir/lib/node_modules"
+    fi
+
+    # Fallback: try npm root -g
+    if [[ -z "$node_modules" ]] || [[ ! -d "$node_modules" ]]; then
+        node_modules=$(npm root -g 2>/dev/null || echo "")
+    fi
+
+    if [[ -z "$node_modules" ]] || [[ ! -d "$node_modules" ]]; then
+        verbose "find_oracle_assistant_response: Cannot find npm global node_modules"
+        return 1
+    fi
+
+    local target_file="$node_modules/@steipete/oracle/dist/src/browser/actions/assistantResponse.js"
+    if [[ -f "$target_file" ]]; then
+        ORACLE_ASSISTANT_RESPONSE_PATH="$target_file"
+        ORACLE_BACKUP_PATH="${target_file}.apr-backup"
+        verbose "find_oracle_assistant_response: Found at $target_file"
+        return 0
+    fi
+
+    verbose "find_oracle_assistant_response: assistantResponse.js not found at $target_file"
+    return 1
+}
+
+patch_oracle_stability_thresholds() {
+    # Skip if already patched this session
+    if [[ "$APR_ORACLE_PATCHED" == "true" ]]; then
+        verbose "patch_oracle_stability_thresholds: Already patched this session"
+        return 0
+    fi
+
+    # Skip if user disabled patching
+    if [[ "${APR_NO_ORACLE_PATCH:-}" == "1" ]]; then
+        verbose "patch_oracle_stability_thresholds: Disabled via APR_NO_ORACLE_PATCH"
+        return 0
+    fi
+
+    # Find the file to patch
+    if ! find_oracle_assistant_response; then
+        print_warning "Cannot find Oracle assistantResponse.js for stability patching"
+        print_warning "GPT Pro Extended Thinking responses may be truncated"
+        return 1
+    fi
+
+    # Check if file is already patched (look for our marker comment)
+    if grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
+        verbose "patch_oracle_stability_thresholds: Already patched (marker found)"
+        APR_ORACLE_PATCHED=true
+        return 0
+    fi
+
+    # Check if we can write to the file
+    if [[ ! -w "$ORACLE_ASSISTANT_RESPONSE_PATH" ]]; then
+        print_warning "Cannot write to Oracle assistantResponse.js (permission denied)"
+        print_warning "Run with sudo or fix permissions: $ORACLE_ASSISTANT_RESPONSE_PATH"
+        return 1
+    fi
+
+    verbose "patch_oracle_stability_thresholds: Patching $ORACLE_ASSISTANT_RESPONSE_PATH"
+
+    # Create backup if it doesn't exist
+    if [[ ! -f "$ORACLE_BACKUP_PATH" ]]; then
+        cp "$ORACLE_ASSISTANT_RESPONSE_PATH" "$ORACLE_BACKUP_PATH"
+        verbose "patch_oracle_stability_thresholds: Backup created at $ORACLE_BACKUP_PATH"
+    fi
+
+    # Apply patches using sed -i (in-place, more robust than echo piping)
+    # Note: Using | as delimiter to avoid escaping issues with /
+
+    # Patch 1: minStableMs in pollAssistantCompletion (line ~293)
+    # Original: const minStableMs = shortAnswer ? 8000 : 1200;
+    # Patched:  const minStableMs = shortAnswer ? 15000 : 30000; /* APR_PATCHED_STABILITY_THRESHOLDS */
+    sed -i "s|const minStableMs = shortAnswer ? 8000 : 1200;|const minStableMs = shortAnswer ? ${APR_ORACLE_SHORT_STABLE_MS} : ${APR_ORACLE_MIN_STABLE_MS}; /* APR_PATCHED_STABILITY_THRESHOLDS */|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+
+    # Patch 2: requiredStableCycles in pollAssistantCompletion (line ~291)
+    # Original: const requiredStableCycles = shortAnswer ? 12 : 6;
+    # Patched:  const requiredStableCycles = shortAnswer ? 18 : 12;
+    sed -i "s|const requiredStableCycles = shortAnswer ? 12 : 6;|const requiredStableCycles = shortAnswer ? 18 : ${APR_ORACLE_STABLE_CYCLES};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+
+    # Patch 3: settleWindowMs in waitForSettle (line ~551)
+    # Original: const settleWindowMs = shortAnswer ? 12_000 : 5_000;
+    # Patched:  const settleWindowMs = shortAnswer ? 15_000 : 30_000;
+    sed -i "s|const settleWindowMs = shortAnswer ? 12_000 : 5_000;|const settleWindowMs = shortAnswer ? 15_000 : ${APR_ORACLE_SETTLE_WINDOW_MS};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+
+    # Patch 4: stableTarget in waitForSettle (line ~557)
+    # Original: const stableTarget = shortAnswer ? 6 : 3;
+    # Patched:  const stableTarget = shortAnswer ? 12 : 6;
+    sed -i "s|const stableTarget = shortAnswer ? 6 : 3;|const stableTarget = shortAnswer ? 12 : 6;|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+
+    # Verify patch was applied
+    if grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
+        APR_ORACLE_PATCHED=true
+        print_success "Patched Oracle stability thresholds for GPT Pro Extended Thinking"
+        verbose "patch_oracle_stability_thresholds: Patch applied successfully"
+        verbose "  minStableMs: ${APR_ORACLE_MIN_STABLE_MS}ms (normal), ${APR_ORACLE_SHORT_STABLE_MS}ms (short)"
+        verbose "  settleWindowMs: ${APR_ORACLE_SETTLE_WINDOW_MS}ms"
+        verbose "  stableCycles: ${APR_ORACLE_STABLE_CYCLES}"
+        return 0
+    else
+        print_warning "Oracle patch may not have applied correctly"
+        return 1
+    fi
+}
+
+restore_oracle_from_backup() {
+    # Restore Oracle's original assistantResponse.js from backup
+    if [[ -z "$ORACLE_BACKUP_PATH" ]]; then
+        find_oracle_assistant_response || return 1
+    fi
+
+    if [[ ! -f "$ORACLE_BACKUP_PATH" ]]; then
+        print_error "No Oracle backup found at $ORACLE_BACKUP_PATH"
+        return 1
+    fi
+
+    cp "$ORACLE_BACKUP_PATH" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    APR_ORACLE_PATCHED=false
+    print_success "Restored Oracle from backup"
+    return 0
+}
+
+# -----------------------------------------------------------------------------
 # Pre-flight Oracle Validation
 # -----------------------------------------------------------------------------
 
@@ -643,6 +825,14 @@ preflight_check() {
 
     # Detect Oracle feature support (--notify may not exist in older versions)
     oracle_detect_features || true
+
+    # Patch Oracle stability thresholds to prevent GPT Pro Extended Thinking truncation
+    # This is critical for reliable spec revision - without it, responses are often cut off mid-sentence
+    if ! patch_oracle_stability_thresholds; then
+        print_warning "Oracle stability patch failed - responses may be truncated"
+        print_warning "Set APR_NO_ORACLE_PATCH=1 to disable this warning"
+        has_warnings=true
+    fi
 
     # Check source files exist and are readable
     if [[ ! -f "$readme_path" ]]; then
@@ -758,6 +948,69 @@ run_oracle_with_retry() {
 
     print_error "All $MAX_RETRY_ATTEMPTS attempts failed"
     return "$exit_code"
+}
+
+# -----------------------------------------------------------------------------
+# Output Validation
+# -----------------------------------------------------------------------------
+# Validates Oracle output file for completeness.
+# Returns 0 if valid, 1 if truncated/incomplete.
+# Sets OUTPUT_VALIDATION_REASON with explanation.
+
+OUTPUT_VALIDATION_REASON=""
+
+# Minimum expected size for a revision round output (in bytes)
+# GPT Pro Extended Reasoning typically produces 10KB+ for spec reviews
+readonly MIN_OUTPUT_SIZE_BYTES=2048
+
+validate_output_file() {
+    local output_file="$1"
+    OUTPUT_VALIDATION_REASON=""
+
+    # Check if file exists
+    if [[ ! -f "$output_file" ]]; then
+        OUTPUT_VALIDATION_REASON="Output file does not exist"
+        return 1
+    fi
+
+    # Check if file is empty
+    local file_size
+    file_size=$(wc -c < "$output_file" 2>/dev/null || echo "0")
+    if [[ "$file_size" -eq 0 ]]; then
+        OUTPUT_VALIDATION_REASON="Output file is empty"
+        return 1
+    fi
+
+    # Check if file is suspiciously small
+    if [[ "$file_size" -lt "$MIN_OUTPUT_SIZE_BYTES" ]]; then
+        OUTPUT_VALIDATION_REASON="Output file is suspiciously small (${file_size} bytes, expected >=${MIN_OUTPUT_SIZE_BYTES})"
+        return 1
+    fi
+
+    # Check if file ends mid-word (truncation indicator)
+    # A properly completed response should end with punctuation, newline, or code block
+    local last_chars
+    last_chars=$(tail -c 50 "$output_file" 2>/dev/null | tr -d '\n\r\t ')
+    if [[ -n "$last_chars" ]]; then
+        local last_char="${last_chars: -1}"
+        # Valid endings: punctuation, quotes, brackets, backticks
+        if [[ ! "$last_char" =~ [.!?\)\]\}\"\'\`\>] ]]; then
+            # Check if it ends mid-word (letter followed by nothing)
+            if [[ "$last_char" =~ [a-zA-Z] ]]; then
+                # Read the last 100 chars to see if we're mid-sentence
+                local context
+                context=$(tail -c 100 "$output_file" 2>/dev/null)
+                # If there's no sentence-ending punctuation in the last 100 chars, likely truncated
+                if [[ ! "$context" =~ [.!?]$ ]] && [[ ! "$context" =~ \`\`\`$ ]]; then
+                    OUTPUT_VALIDATION_REASON="Output appears truncated (ends mid-word: '...${last_chars: -20}')"
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
+    # Output looks valid
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -2861,11 +3114,60 @@ run_round() {
         echo "" >&2
 
         if [[ $oracle_exit -eq 0 ]]; then
-            print_success "Review complete! (${elapsed_fmt} elapsed)"
-            print_info "Output saved to: $output_file"
+            # Validate output file for completeness
+            if ! validate_output_file "$output_file"; then
+                print_warning "Output validation failed: $OUTPUT_VALIDATION_REASON"
+                print_info "Attempting automatic recovery via Oracle session reattach..."
+                echo "" >&2
 
-            # Best-effort metrics collection
-            if command -v jq &>/dev/null; then
+                # Try to recover via Oracle session reattach
+                local recovery_success=false
+                local recovery_output_file="${output_file}.recovery"
+
+                # Wait a bit for ChatGPT to complete if it's still generating
+                print_dim "Waiting 30s for ChatGPT to complete generation..."
+                sleep 30
+
+                # Try to get the full output via session reattach
+                if "${ORACLE_CMD[@]}" session "$slug" --write-output "$recovery_output_file" 2>/dev/null; then
+                    if validate_output_file "$recovery_output_file"; then
+                        # Recovery successful - replace truncated output
+                        mv "$recovery_output_file" "$output_file"
+                        OUTPUT_VALIDATION_REASON=""
+                        recovery_success=true
+                        print_success "Recovery successful! Full output retrieved via session reattach."
+                    else
+                        rm -f "$recovery_output_file"
+                        verbose "Recovery output also invalid: $OUTPUT_VALIDATION_REASON"
+                    fi
+                else
+                    verbose "Oracle session reattach failed for slug: $slug"
+                fi
+
+                if [[ "$recovery_success" != "true" ]]; then
+                    print_error "Automatic recovery failed"
+                    print_warning "The response was truncated by Oracle's browser automation."
+                    print_info "This happens when GPT Pro Extended Thinking pauses during reasoning."
+                    echo "" >&2
+                    print_info "Manual recovery options:"
+                    print_info "  1. Re-run the round: apr run $round_num --wait"
+                    print_info "  2. Check the Oracle session: apr attach $slug"
+                    print_info "  3. File an issue if this persists: https://github.com/steipete/oracle/issues"
+                    echo "" >&2
+                    print_info "Partial output saved to: $output_file"
+                    # Continue but mark as incomplete for metrics
+                fi
+            fi
+
+            if [[ -z "$OUTPUT_VALIDATION_REASON" ]]; then
+                print_success "Review complete! (${elapsed_fmt} elapsed)"
+                print_info "Output saved to: $output_file"
+            fi
+
+            # Best-effort metrics collection (skip if output is invalid)
+            if [[ -n "$OUTPUT_VALIDATION_REASON" ]]; then
+                print_warning "Skipping metrics collection due to invalid output"
+            elif command -v jq &>/dev/null; then
                 local doc_metrics round_record
                 doc_metrics=$(collect_round_document_metrics "$workflow" "$round_num" \
                     "$readme_path" "$spec_path" "$impl_path" "$output_file") || {
