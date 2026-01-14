@@ -891,6 +891,22 @@ export APR_INITIAL_BACKOFF=15
 
 The exponential backoff (multiplier of 3) prevents hammering the service while giving transient issues time to resolve.
 
+### GPT Pro Extended Thinking Stability
+
+GPT Pro Extended Thinking can pause for 10-30+ seconds during its reasoning phase. Without adjustment, Oracle's browser automation might interpret these pauses as "response complete" and capture truncated output.
+
+APR automatically patches Oracle's stability detection thresholds at runtime to tolerate these long pauses:
+
+| Parameter | Oracle Default | APR Default | Purpose |
+|-----------|---------------|-------------|---------|
+| `minStableMs` | 1.2s | 30s | Time text must stop changing |
+| `settleWindowMs` | 5s | 30s | Completion detection window |
+| `stableCycles` | 6 | 12 | Polling cycles required |
+
+The patch is applied during pre-flight checks and persists until Oracle is updated. A backup of the original file is preserved for restoration.
+
+**Automatic recovery:** If truncation is detected despite patching (output ends mid-word), APR waits 30 seconds and attempts to reattach to the Oracle session to capture the complete response.
+
 ### Session Locking
 
 Concurrent runs of the same workflow can cause data corruption or wasted Oracle sessions. APR uses file-based locking:
@@ -1659,6 +1675,17 @@ sudo apt-get install jq
 | `APR_MAX_RETRIES` | Maximum Oracle retry attempts | `3` |
 | `APR_INITIAL_BACKOFF` | Initial retry delay (seconds) | `10` |
 
+### Oracle Stability Thresholds
+
+These control how APR patches Oracle to tolerate GPT Pro Extended Thinking pauses:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `APR_ORACLE_MIN_STABLE_MS` | Time text must stop changing before considered complete | `30000` |
+| `APR_ORACLE_SHORT_STABLE_MS` | Shorter threshold for non-extended responses | `15000` |
+| `APR_ORACLE_SETTLE_WINDOW_MS` | Completion detection window | `30000` |
+| `APR_ORACLE_STABLE_CYCLES` | Polling cycles required for stability | `12` |
+
 ### Status & Monitoring
 
 | Variable | Description | Default |
@@ -1842,6 +1869,31 @@ apr attach apr-default-round-5
 
 # Or use Oracle directly
 npx -y @steipete/oracle session apr-default-round-5 --render
+```
+
+</details>
+
+<details>
+<summary><strong>Response appears truncated or incomplete</strong></summary>
+
+**Cause:** GPT Pro Extended Thinking can pause for 10-30+ seconds during reasoning. If Oracle's stability thresholds are too low, it may capture output prematurely.
+
+**Fix:**
+
+APR automatically patches Oracle's stability thresholds to tolerate extended thinking pauses. If you still experience truncation:
+
+```bash
+# Increase the stability wait time (milliseconds)
+export APR_ORACLE_MIN_STABLE_MS=45000
+export APR_ORACLE_SETTLE_WINDOW_MS=45000
+
+# Then re-run
+apr run 5
+```
+
+If output was captured mid-response, try reattaching:
+```bash
+apr attach apr-default-round-5
 ```
 
 </details>
