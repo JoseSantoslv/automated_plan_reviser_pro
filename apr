@@ -86,6 +86,34 @@ readonly EXIT_DEPENDENCY_ERROR=3  # Missing Oracle, Node.js, etc.
 readonly EXIT_CONFIG_ERROR=4      # Invalid config, missing files
 readonly EXIT_NETWORK_ERROR=10    # Timeout, DNS, unreachable
 readonly EXIT_UPDATE_ERROR=11     # Self-update failed
+readonly EXIT_BUSY_ERROR=12       # Single-flight / busy (e.g. lock already held)
+
+# -----------------------------------------------------------------------------
+# Error code taxonomy (robot `.code`) and mapping to exit codes
+# -----------------------------------------------------------------------------
+# NOTE: Robot mode uses `.code` (string) as the stable, machine-readable failure
+# class. Human mode should emit a grep-friendly stderr tag for fatal errors:
+#   APR_ERROR_CODE=<code>
+apr_emit_error_code_tag() {
+    local code="${1:-internal_error}"
+    # ASCII-only, stable tag for automation.
+    printf 'APR_ERROR_CODE=%s\n' "$code" >&2
+}
+
+apr_exit_code_for_code() {
+    local code="$1"
+    case "$code" in
+        ok) echo "$EXIT_SUCCESS" ;;
+        usage_error) echo "$EXIT_USAGE_ERROR" ;;
+        dependency_missing) echo "$EXIT_DEPENDENCY_ERROR" ;;
+        not_configured|config_error|validation_failed|attachment_mismatch) echo "$EXIT_CONFIG_ERROR" ;;
+        network_error) echo "$EXIT_NETWORK_ERROR" ;;
+        update_error) echo "$EXIT_UPDATE_ERROR" ;;
+        busy) echo "$EXIT_BUSY_ERROR" ;;
+        not_implemented|internal_error) echo "$EXIT_PARTIAL_FAILURE" ;;
+        *) echo "$EXIT_PARTIAL_FAILURE" ;;
+    esac
+}
 
 # -----------------------------------------------------------------------------
 # Colors (conditional on TTY and NO_COLOR)
@@ -879,6 +907,16 @@ preflight_check() {
     readme_size=$(du -h "$readme_path" 2>/dev/null | cut -f1)
     verbose "preflight: README exists: $readme_path ($readme_size)"
     print_success "README: $readme_path ($readme_size)"
+    local readme_bytes
+    readme_bytes=$(wc -c < "$readme_path" 2>/dev/null || echo "0")
+    if [[ "$readme_bytes" -eq 0 ]]; then
+        print_error "Pre-flight failed: README is empty: $readme_path"
+        return 1
+    fi
+    if [[ "$readme_bytes" -lt 64 ]]; then
+        print_warning "README is suspiciously small (${readme_bytes} bytes): $readme_path"
+        has_warnings=true
+    fi
 
     if [[ ! -f "$spec_path" ]]; then
         print_error "Pre-flight failed: Spec not found: $spec_path"
@@ -892,6 +930,16 @@ preflight_check() {
     spec_size=$(du -h "$spec_path" 2>/dev/null | cut -f1)
     verbose "preflight: Spec exists: $spec_path ($spec_size)"
     print_success "Spec: $spec_path ($spec_size)"
+    local spec_bytes
+    spec_bytes=$(wc -c < "$spec_path" 2>/dev/null || echo "0")
+    if [[ "$spec_bytes" -eq 0 ]]; then
+        print_error "Pre-flight failed: Spec is empty: $spec_path"
+        return 1
+    fi
+    if [[ "$spec_bytes" -lt 64 ]]; then
+        print_warning "Spec is suspiciously small (${spec_bytes} bytes): $spec_path"
+        has_warnings=true
+    fi
 
     # Check implementation file if provided
     if [[ -n "$impl_path" ]]; then
@@ -906,6 +954,16 @@ preflight_check() {
             impl_size=$(du -h "$impl_path" 2>/dev/null | cut -f1)
             verbose "preflight: Implementation exists: $impl_path ($impl_size)"
             print_success "Implementation: $impl_path ($impl_size)"
+            local impl_bytes
+            impl_bytes=$(wc -c < "$impl_path" 2>/dev/null || echo "0")
+            if [[ "$impl_bytes" -eq 0 ]]; then
+                print_error "Pre-flight failed: Implementation is empty: $impl_path"
+                return 1
+            fi
+            if [[ "$impl_bytes" -lt 64 ]]; then
+                print_warning "Implementation is suspiciously small (${impl_bytes} bytes): $impl_path"
+                has_warnings=true
+            fi
         fi
     fi
 
@@ -917,6 +975,79 @@ preflight_check() {
         print_success "All pre-flight checks passed"
         return 0
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Prompt Quality Controls
+# -----------------------------------------------------------------------------
+#
+# Browser automation runs are expensive and slow. We fail fast on common
+# "how did that even happen?" mistakes and produce actionable errors.
+
+PROMPT_QC_REASON=""
+PROMPT_QC_DETAILS=""
+
+# Validate that the prompt we send to Oracle/ChatGPT does not contain obvious
+# unexpanded placeholders (e.g. {{README}}). APR does NOT expand mustache-style
+# placeholders; if they appear here, the model will see them verbatim.
+#
+# Usage:
+#   prompt_quality_check "$prompt" "$config_path" "label"
+#
+# Returns:
+#   0 if OK
+#   1 if fatal (PROMPT_QC_REASON + PROMPT_QC_DETAILS set)
+prompt_quality_check() {
+    local prompt="$1"
+    local config_path="${2:-}"
+    local label="${3:-prompt}"
+
+    PROMPT_QC_REASON=""
+    PROMPT_QC_DETAILS=""
+
+    # Escape hatch for advanced use (default is strict).
+    if [[ "${APR_ALLOW_CURLY_PLACEHOLDERS:-}" == "1" ]]; then
+        return 0
+    fi
+
+    # Guard: '{{' / '}}' in the prompt almost always means "expected substitution"
+    # but nothing will substitute it.
+    if printf '%s' "$prompt" | /usr/bin/grep -Fq '{{' || printf '%s' "$prompt" | /usr/bin/grep -Fq '}}'; then
+        PROMPT_QC_REASON="Prompt contains unexpanded placeholders ('{{' / '}}'). APR does not substitute these."
+
+        local prompt_hits cfg_hits
+        prompt_hits=$(printf '%s\n' "$prompt" | awk -v label="$label" 'index($0,"{{") || index($0,"}}") { printf "  %s:%d: %s\n", label, NR, $0 }' | head -n 8)
+
+        cfg_hits=""
+        if [[ -n "$config_path" && -f "$config_path" ]]; then
+            cfg_hits=$(awk 'index($0,"{{") || index($0,"}}") { printf "  %s:%d: %s\n", FILENAME, NR, $0 }' "$config_path" | head -n 8)
+        fi
+
+        PROMPT_QC_DETAILS=$(
+            cat <<EOF
+Why this fails:
+- The model will literally see "{{README}}" instead of the README contents.
+- APR already attaches the files via Oracle; the prompt should reference them by name.
+
+Fix:
+- Remove {{...}} placeholders from your workflow templates.
+- Replace with instructions like: "Read the attached README.md" / "Read the attached spec file".
+
+Offending lines:
+${prompt_hits:-  (no prompt hits captured)}
+
+Config hits:
+${cfg_hits:-  (no config hits captured)}
+
+Override (not recommended):
+- Set APR_ALLOW_CURLY_PLACEHOLDERS=1 to bypass this guard.
+EOF
+        )
+
+        return 1
+    fi
+
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -3034,6 +3165,19 @@ run_round() {
         return 1
     fi
 
+    # Quality gate: refuse to run if the prompt contains obvious unexpanded placeholders.
+    if ! prompt_quality_check "$prompt" "$config_path" "prompt"; then
+        if [[ "$ROBOT_MODE" == "true" ]]; then
+            robot_json false "validation_failed" "$(jq -nc --arg err "$PROMPT_QC_REASON" '{errors:[$err]}')" \
+                "Fix workflow template before running"
+        else
+            print_error "Prompt quality check failed: $PROMPT_QC_REASON"
+            echo "" >&2
+            echo "$PROMPT_QC_DETAILS" >&2
+        fi
+        return 1
+    fi
+
     # Best-effort Oracle feature detection for accurate dry-run output and
     # to enable optional flags when preflight is skipped.
     # Note: In dry-run/render mode, preflight_check doesn't run, so check_oracle
@@ -3282,6 +3426,9 @@ run_round() {
         fi
     else
         (
+            # Bash will SIGHUP background jobs on shell exit. Ignore HUP so the
+            # background run keeps going after `apr run` returns.
+            trap "" HUP
             if [[ "$enable_retry" == "true" ]]; then
                 run_oracle_with_retry "${oracle_args[@]}"
             else
@@ -3494,7 +3641,9 @@ show_history() {
     fi
 
     local sorted_entries=()
-    mapfile -t sorted_entries < <(printf '%s\n' "${round_entries[@]}" | sort -n -t '|' -k1,1)
+    if [[ ${#round_entries[@]} -gt 0 ]]; then
+        mapfile -t sorted_entries < <(printf '%s\n' "${round_entries[@]}" | sort -n -t '|' -k1,1)
+    fi
 
     # Display each round with enhanced info
     for entry in "${sorted_entries[@]}"; do
@@ -5088,13 +5237,70 @@ backfill_all_workflows() {
 # All robot mode output goes to stdout as valid JSON.
 # Response envelope: { ok, code, data, hint?, meta: {v, ts} }
 #
-# Error codes: ok, not_configured, not_found, validation_failed, oracle_error
+# Error codes (`.code`): ok, usage_error, not_configured, config_error,
+# validation_failed, dependency_missing, busy, network_error, update_error,
+# attachment_mismatch, not_implemented, internal_error
 # =============================================================================
 
 # Robot mode state
 # shellcheck disable=SC2034  # State flag for helper functions
 ROBOT_MODE=false
 ROBOT_COMPACT=false
+# Robot output format (resolved in cmd_robot): json|toon
+ROBOT_FORMAT="json"
+ROBOT_FORMAT_OVERRIDE=""
+
+robot_resolve_output_format() {
+    local explicit="${1:-}"
+    local fmt=""
+
+    if [[ -n "$explicit" ]]; then
+        fmt="$explicit"
+    elif [[ -n "${APR_OUTPUT_FORMAT:-}" ]]; then
+        fmt="$APR_OUTPUT_FORMAT"
+    elif [[ -n "${TOON_DEFAULT_FORMAT:-}" ]]; then
+        fmt="$TOON_DEFAULT_FORMAT"
+    else
+        fmt="json"
+    fi
+
+    fmt="${fmt,,}"
+    case "$fmt" in
+        json|toon)
+            echo "$fmt"
+            return 0
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+}
+
+robot_try_load_toon_sh() {
+    # Avoid hard dependency; only used when --format toon is requested.
+    if declare -F toon_encode >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local toon_sh="${TOON_SH_PATH:-$HOME/.local/lib/toon.sh}"
+    if [[ -f "$toon_sh" ]]; then
+        # shellcheck source=/dev/null
+        source "$toon_sh" 2>/dev/null || true
+    fi
+
+    declare -F toon_encode >/dev/null 2>&1
+}
+
+robot_json_to_toon() {
+    local json="$1"
+    if ! robot_try_load_toon_sh; then
+        return 1
+    fi
+    if ! toon_available >/dev/null 2>&1; then
+        return 1
+    fi
+    printf '%s' "$json" | toon_encode
+}
 
 # Build JSON response using jq (required for robot mode)
 # Usage: robot_json ok|false code data_json [hint]
@@ -5126,11 +5332,46 @@ robot_json() {
             '{ok: $ok, code: $code, data: $data, meta: {v: $v, ts: $ts}}')
     fi
 
+    if [[ "${ROBOT_FORMAT:-json}" == "toon" ]]; then
+        local toon_out
+        if toon_out="$(robot_json_to_toon "$result" 2>/dev/null)"; then
+            printf '%s' "$toon_out"
+        else
+            echo "[toon] warn: tru/toon.sh not available; outputting JSON" >&2
+            if [[ "$ROBOT_COMPACT" == "true" ]]; then
+                echo "$result"
+            else
+                echo "$result" | jq .
+            fi
+        fi
+        return 0
+    fi
+
     if [[ "$ROBOT_COMPACT" == "true" ]]; then
         echo "$result"
     else
         echo "$result" | jq .
     fi
+}
+
+robot_fail() {
+    local code="$1"
+    local data="${2:-}"
+    local hint="${3:-}"
+    if [[ -z "$data" ]]; then
+        data='{}'
+    fi
+    robot_json false "$code" "$data" "$hint"
+    apr_emit_error_code_tag "$code"
+    local exit_code
+    exit_code="$(apr_exit_code_for_code "$code")"
+
+    # Unit tests source apr (with main() removed). In that mode we must not
+    # `exit`, or we terminate the test runner. Return the mapped exit code.
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return "$exit_code"
+    fi
+    exit "$exit_code"
 }
 
 # Robot: Status - System overview
@@ -5207,8 +5448,8 @@ robot_status() {
 # Robot: Workflows - List all workflows
 robot_workflows() {
     if [[ ! -d "$CONFIG_DIR/workflows" ]]; then
-        robot_json false "not_configured" '{"workflows":[]}' "Run 'apr robot init' then 'apr setup'"
-        return 1
+        robot_fail "not_configured" '{"workflows":[]}' "Run 'apr robot init' then 'apr setup'"
+        return $?
     fi
 
     local items=()
@@ -5238,14 +5479,14 @@ robot_init() {
 
     # Handle errors gracefully to ensure JSON output
     if ! mkdir -p "$CONFIG_DIR/workflows" "$CONFIG_DIR/rounds" 2>/dev/null; then
-        robot_json false "init_failed" "$(jq -nc --arg dir "$CONFIG_DIR" '{directory: $dir}')" "Failed to create directory: $CONFIG_DIR"
-        return 1
+        robot_fail "config_error" "$(jq -nc --arg dir "$CONFIG_DIR" '{directory: $dir}')" "Failed to create directory: $CONFIG_DIR"
+        return $?
     fi
 
     if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
         if ! echo "default_workflow: default" > "$CONFIG_DIR/config.yaml" 2>/dev/null; then
-            robot_json false "init_failed" '{"reason":"config_write"}' "Failed to write config file"
-            return 1
+            robot_fail "config_error" '{"reason":"config_write"}' "Failed to write config file"
+            return $?
         fi
     fi
 
@@ -5292,6 +5533,23 @@ robot_validate() {
         if [[ -z "$output_dir" ]]; then
             errors+=("Output directory not configured in workflow")
         fi
+
+        # Prompt quality checks (fail fast before expensive Oracle runs).
+        local prompt_no_impl=""
+        prompt_no_impl=$(build_revision_prompt "false" "$wf_file" 2>/dev/null || echo "")
+        if [[ -n "$prompt_no_impl" ]]; then
+            if ! prompt_quality_check "$prompt_no_impl" "$wf_file" "template"; then
+                errors+=("$PROMPT_QC_REASON (template)")
+            fi
+        fi
+
+        local prompt_with_impl=""
+        prompt_with_impl=$(build_revision_prompt "true" "$wf_file" 2>/dev/null || echo "")
+        if [[ -n "$prompt_with_impl" ]]; then
+            if ! prompt_quality_check "$prompt_with_impl" "$wf_file" "template_with_impl"; then
+                errors+=("$PROMPT_QC_REASON (template_with_impl)")
+            fi
+        fi
     fi
 
     # Check Oracle
@@ -5329,8 +5587,16 @@ robot_validate() {
     if [[ "$valid" == "true" ]]; then
         robot_json true "ok" "$data"
     else
-        robot_json false "validation_failed" "$data" "Fix errors before running"
-        return 1
+        local fail_code="validation_failed"
+        # Prefer argument errors over environment/config state. If the user
+        # invokes `apr robot validate` without a round, that's a usage error
+        # regardless of whether .apr is initialized.
+        if [[ -z "$round_num" ]] || ! is_non_negative_int "$round_num"; then
+            fail_code="usage_error"
+        elif [[ ! -d "$CONFIG_DIR" ]]; then
+            fail_code="not_configured"
+        fi
+        robot_fail "$fail_code" "$data" "Fix errors before running"
     fi
 }
 
@@ -5344,27 +5610,27 @@ robot_run() {
 
     # First validate
     if [[ -z "$round_num" ]]; then
-        robot_json false "missing_argument" '{"argument":"round"}' "Round number required"
-        return 1
+        robot_fail "usage_error" '{"argument":"round"}' "Round number required"
+        return $?
     fi
 
     if ! is_non_negative_int "$round_num"; then
-        robot_json false "invalid_argument" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" "Round must be a non-negative integer"
-        return 1
+        robot_fail "usage_error" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" "Round must be a non-negative integer"
+        return $?
     fi
 
     # Check Oracle
     if ! check_oracle; then
-        robot_json false "dependency_missing" '{"dependency":"oracle"}' "Oracle not available"
-        return 1
+        robot_fail "dependency_missing" '{"dependency":"oracle"}' "Oracle not available"
+        return $?
     fi
     oracle_detect_features || true
 
     # Load workflow config
     local config_path="$CONFIG_DIR/workflows/$workflow.yaml"
     if [[ ! -f "$config_path" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "workflow", name: $wf}')" "Workflow not found"
-        return 1
+        robot_fail "usage_error" "$(jq -nc --arg wf "$workflow" '{argument: "workflow", value: $wf}')" "Workflow not found"
+        return $?
     fi
 
     # Parse config
@@ -5385,22 +5651,22 @@ robot_run() {
     fi
 
     if [[ -z "$model" ]]; then
-        robot_json false "validation_failed" '{"errors":["Model not configured in workflow"]}' "Fix workflow configuration"
-        return 1
+        robot_fail "config_error" '{"field":"model"}' "Model not configured in workflow"
+        return $?
     fi
     if [[ -z "$output_dir" ]]; then
-        robot_json false "validation_failed" '{"errors":["Output directory not configured in workflow"]}' "Fix workflow configuration"
-        return 1
+        robot_fail "config_error" '{"field":"output_dir"}' "Output directory not configured in workflow"
+        return $?
     fi
 
     # Validate required files
     if [[ ! -f "$readme_path" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg f "$readme_path" '{resource: "file", path: $f}')" "README file not found"
-        return 1
+        robot_fail "config_error" "$(jq -nc --arg f "$readme_path" '{resource: "file", path: $f}')" "README file not found"
+        return $?
     fi
     if [[ ! -f "$spec_path" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg f "$spec_path" '{resource: "file", path: $f}')" "Spec file not found"
-        return 1
+        robot_fail "config_error" "$(jq -nc --arg f "$spec_path" '{resource: "file", path: $f}')" "Spec file not found"
+        return $?
     fi
 
     if [[ "$include_impl" == "true" ]]; then
@@ -5419,8 +5685,8 @@ robot_run() {
 
     # Check if output file already exists (Robot mode safety)
     if [[ -f "$output_file" ]]; then
-        robot_json false "already_exists" "$(jq -nc --arg path "$output_file" '{file: $path}')" "Output file already exists"
-        return 1
+        robot_fail "validation_failed" "$(jq -nc --arg path "$output_file" '{kind:"output_exists", file: $path}')" "Output file already exists"
+        return $?
     fi
 
     # Acquire lock so concurrent robot runs can't trample the same workflow/round.
@@ -5428,9 +5694,9 @@ robot_run() {
     if ! acquire_lock "$workflow" "$round_num"; then
         local existing_pid=""
         existing_pid=$(cat "$lock_file" 2>/dev/null || echo "")
-        robot_json false "already_exists" "$(jq -nc --arg wf "$workflow" --argjson r "$round_num" --arg lock "$lock_file" --arg pid "$existing_pid" '{workflow: $wf, round: $r, lock_file: $lock, pid: $pid}')" \
+        robot_fail "busy" "$(jq -nc --arg wf "$workflow" --argjson r "$round_num" --arg lock "$lock_file" --arg pid "$existing_pid" '{workflow: $wf, round: $r, lock_file: $lock, pid: $pid}')" \
             "Another APR process is already running this round"
-        return 1
+        return $?
     fi
 
     # Build file arguments
@@ -5444,16 +5710,25 @@ robot_run() {
     local prompt
     prompt=$(build_revision_prompt "$include_impl" "$config_path")
     if [[ -z "$prompt" ]]; then
-        robot_json false "validation_failed" '{"errors":["Prompt template is empty"]}' \
+        release_lock 2>/dev/null || true
+        robot_fail "config_error" '{"errors":["Prompt template is empty"]}' \
             "Add 'template' or 'template_with_impl' to workflow"
-        return 1
+        return $?
+    fi
+
+    if ! prompt_quality_check "$prompt" "$config_path" "prompt"; then
+        release_lock 2>/dev/null || true
+        robot_fail "validation_failed" "$(jq -nc --arg err "$PROMPT_QC_REASON" '{errors:[$err]}')" \
+            "Fix workflow template (remove {{...}} placeholders) before running"
+        return $?
     fi
 
     # Create output directory
     if ! mkdir -p "$(dirname "$output_file")" 2>/dev/null; then
-        robot_json false "config_error" "$(jq -nc --arg dir "$(dirname "$output_file")" '{directory: $dir}')" \
+        release_lock 2>/dev/null || true
+        robot_fail "config_error" "$(jq -nc --arg dir "$(dirname "$output_file")" '{directory: $dir}')" \
             "Failed to create output directory"
-        return 1
+        return $?
     fi
 
     # Build Oracle command
@@ -5483,6 +5758,9 @@ robot_run() {
     fi
 
     (
+        # Bash will SIGHUP background jobs on shell exit. Ignore HUP so the
+        # detached robot run can survive after `apr` exits.
+        trap "" HUP
         run_oracle_with_retry "${oracle_args[@]}"
     ) >"$oracle_log" 2>&1 &
     local oracle_pid=$!
@@ -5493,8 +5771,8 @@ robot_run() {
     # Verify the process is actually running
     if ! kill -0 "$oracle_pid" 2>/dev/null; then
         release_lock 2>/dev/null || true
-        robot_json false "oracle_error" '{"reason":"process_start_failed"}' "Oracle process failed to start immediately"
-        return 1
+        robot_fail "internal_error" '{"reason":"process_start_failed"}' "Oracle process failed to start immediately"
+        return $?
     fi
 
     background_lock_detach_parent "$oracle_pid"
@@ -5529,8 +5807,8 @@ robot_history() {
     local rounds_dir="$CONFIG_DIR/rounds/$workflow"
 
     if [[ ! -d "$rounds_dir" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "rounds", workflow: $wf}')" "No rounds found for workflow"
-        return 1
+        robot_fail "validation_failed" "$(jq -nc --arg wf "$workflow" '{resource: "rounds", workflow: $wf}')" "No rounds found for workflow"
+        return $?
     fi
 
     local round_entries=()
@@ -5543,7 +5821,9 @@ robot_history() {
     done
 
     local sorted_entries=()
-    mapfile -t sorted_entries < <(printf '%s\n' "${round_entries[@]}" | sort -n -t '|' -k1,1)
+    if [[ ${#round_entries[@]} -gt 0 ]]; then
+        mapfile -t sorted_entries < <(printf '%s\n' "${round_entries[@]}" | sort -n -t '|' -k1,1)
+    fi
 
     local rounds=()
     for entry in "${sorted_entries[@]}"; do
@@ -5579,19 +5859,22 @@ robot_history() {
 # Robot: Stats - Analytics metrics summary
 robot_stats() {
     if ! command -v jq &>/dev/null; then
-        robot_json false "dependency_missing" '{"dependency":"jq"}' "Robot stats requires jq"
-        return 1
+        robot_fail "dependency_missing" '{"dependency":"jq"}' "Robot stats requires jq"
+        return $?
     fi
 
     local workflow="${WORKFLOW:-default}"
     if ! metrics_exists "$workflow"; then
-        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "metrics", workflow: $wf}')" \
+        robot_fail "validation_failed" "$(jq -nc --arg wf "$workflow" '{resource: "metrics", workflow: $wf}')" \
             "No metrics found. Run some rounds or backfill."
-        return 1
+        return $?
     fi
 
     local metrics round_count avg_size convergence rounds
-    metrics=$(metrics_read "$workflow") || return 1
+    if ! metrics=$(metrics_read "$workflow"); then
+        robot_fail "config_error" "$(jq -nc --arg wf "$workflow" '{resource: "metrics", workflow: $wf}')" "Failed to read metrics"
+        return $?
+    fi
     round_count=$(echo "$metrics" | jq -r '.rounds | length' 2>/dev/null || echo "0")
     avg_size=$(echo "$metrics" | jq -r '[.rounds[].output.char_count // 0] | if length > 0 then (add / length) else 0 end' 2>/dev/null || echo "0")
     convergence=$(echo "$metrics" | jq -c '.convergence // {}' 2>/dev/null || echo "{}")
@@ -5621,26 +5904,26 @@ robot_show() {
     local workflow="${WORKFLOW:-default}"
 
     if [[ -z "$round_num" ]]; then
-        robot_json false "missing_argument" '{"argument":"round"}' "Round number required"
-        return 1
+        robot_fail "usage_error" '{"argument":"round"}' "Round number required"
+        return $?
     fi
     if ! is_non_negative_int "$round_num"; then
-        robot_json false "invalid_argument" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" \
+        robot_fail "usage_error" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" \
             "Round must be a non-negative integer"
-        return 1
+        return $?
     fi
 
     # Verify workflow exists
     local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
     if [[ ! -f "$workflow_file" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "workflow", name: $wf}')" "Workflow not found"
-        return 1
+        robot_fail "usage_error" "$(jq -nc --arg wf "$workflow" '{argument: "workflow", value: $wf}')" "Workflow not found"
+        return $?
     fi
 
     local round_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
     if [[ ! -f "$round_file" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg r "$round_num" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round not found"
-        return 1
+        robot_fail "usage_error" "$(jq -nc --arg r "$round_num" --arg wf "$workflow" '{argument: "round", value: $r, workflow: $wf}')" "Round not found"
+        return $?
     fi
 
     local content char_count line_count word_count mtime
@@ -5683,25 +5966,25 @@ robot_diff() {
     local workflow="${WORKFLOW:-default}"
 
     if [[ -z "$arg1" ]]; then
-        robot_json false "missing_argument" '{"argument":"round_a"}' "At least one round number required"
-        return 1
+        robot_fail "usage_error" '{"argument":"round_a"}' "At least one round number required"
+        return $?
     fi
     if ! is_non_negative_int "$arg1"; then
-        robot_json false "invalid_argument" "$(jq -nc --arg round "$arg1" '{argument: "round_a", value: $round}')" \
+        robot_fail "usage_error" "$(jq -nc --arg round "$arg1" '{argument: "round_a", value: $round}')" \
             "Round must be a non-negative integer"
-        return 1
+        return $?
     fi
     if [[ -n "$arg2" ]] && ! is_non_negative_int "$arg2"; then
-        robot_json false "invalid_argument" "$(jq -nc --arg round "$arg2" '{argument: "round_b", value: $round}')" \
+        robot_fail "usage_error" "$(jq -nc --arg round "$arg2" '{argument: "round_b", value: $round}')" \
             "Round must be a non-negative integer"
-        return 1
+        return $?
     fi
 
     # Verify workflow exists
     local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
     if [[ ! -f "$workflow_file" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "workflow", name: $wf}')" "Workflow not found"
-        return 1
+        robot_fail "usage_error" "$(jq -nc --arg wf "$workflow" '{argument: "workflow", value: $wf}')" "Workflow not found"
+        return $?
     fi
 
     local rounds_dir="$CONFIG_DIR/rounds/$workflow"
@@ -5712,8 +5995,8 @@ robot_diff() {
     if [[ -z "$arg2" ]]; then
         round_new="$arg1"
         if [[ "$round_new" -le 1 ]]; then
-            robot_json false "invalid_argument" '{"argument":"round_a","reason":"no_previous"}' "Round 1 has no previous round to compare with"
-            return 1
+            robot_fail "usage_error" '{"argument":"round_a","reason":"no_previous"}' "Round 1 has no previous round to compare with"
+            return $?
         fi
         round_old=$((round_new - 1))
     else
@@ -5730,12 +6013,12 @@ robot_diff() {
     local file_new="$rounds_dir/round_${round_new}.md"
 
     if [[ ! -f "$file_old" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg r "$round_old" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round $round_old not found"
-        return 1
+        robot_fail "usage_error" "$(jq -nc --arg r "$round_old" --arg wf "$workflow" '{argument: "round", value: $r, workflow: $wf}')" "Round $round_old not found"
+        return $?
     fi
     if [[ ! -f "$file_new" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg r "$round_new" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round $round_new not found"
-        return 1
+        robot_fail "usage_error" "$(jq -nc --arg r "$round_new" --arg wf "$workflow" '{argument: "round", value: $r, workflow: $wf}')" "Round $round_new not found"
+        return $?
     fi
 
     # Get file stats
@@ -5786,34 +6069,34 @@ robot_integrate() {
     local workflow="${WORKFLOW:-default}"
 
     if [[ -z "$round_num" ]]; then
-        robot_json false "missing_argument" '{"argument":"round"}' "Round number required"
-        return 1
+        robot_fail "usage_error" '{"argument":"round"}' "Round number required"
+        return $?
     fi
     if ! is_non_negative_int "$round_num"; then
-        robot_json false "invalid_argument" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" \
+        robot_fail "usage_error" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" \
             "Round must be a non-negative integer"
-        return 1
+        return $?
     fi
 
     # Verify workflow exists
     local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
     if [[ ! -f "$workflow_file" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "workflow", name: $wf}')" "Workflow not found"
-        return 1
+        robot_fail "usage_error" "$(jq -nc --arg wf "$workflow" '{argument: "workflow", value: $wf}')" "Workflow not found"
+        return $?
     fi
 
     # Get spec path
     local spec_path
     spec_path=$(yaml_unquote "$(get_config_value "spec" "$workflow_file")")
     if [[ -z "$spec_path" ]]; then
-        robot_json false "config_error" '{"field":"spec"}' "Spec path not configured in workflow"
-        return 1
+        robot_fail "config_error" '{"field":"spec"}' "Spec path not configured in workflow"
+        return $?
     fi
 
     local round_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
     if [[ ! -f "$round_file" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg r "$round_num" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round not found"
-        return 1
+        robot_fail "usage_error" "$(jq -nc --arg r "$round_num" --arg wf "$workflow" '{argument: "round", value: $r, workflow: $wf}')" "Round not found"
+        return $?
     fi
 
     local round_content round_size
@@ -5886,6 +6169,7 @@ robot_help() {
         options: {
             "-w, --workflow NAME": "Workflow name (default: from config)",
             "-i, --include-impl": "Include implementation document",
+            "-f, --format FORMAT": "Robot output format: json or toon (env: APR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)",
             "--compact": "Minified JSON output"
         },
         examples: [
@@ -5913,8 +6197,12 @@ cmd_robot() {
 
     # Check jq is available (required for robot mode)
     if ! command -v jq &>/dev/null; then
+        apr_emit_error_code_tag "dependency_missing"
         # Output to stdout (not stderr) for consistency with robot mode JSON output
-        echo '{"ok":false,"code":"dependency_missing","data":{},"hint":"Robot mode requires jq. Install with: apt install jq","meta":{"v":"'"$VERSION"'"}}'
+        echo '{"ok":false,"code":"dependency_missing","data":{},"hint":"Robot mode requires jq. Install with: apt install jq","meta":{"v":"'"$VERSION"'","ts":"'"$(iso_timestamp)"'"}}'
+        if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+            return $EXIT_DEPENDENCY_ERROR
+        fi
         exit $EXIT_DEPENDENCY_ERROR
     fi
 
@@ -5928,15 +6216,27 @@ cmd_robot() {
                 ROBOT_COMPACT=true
                 shift
                 ;;
+            --format|-f)
+                if [[ -z "${2:-}" ]]; then
+                    robot_fail "usage_error" '{"option":"--format"}' "Option --format requires a value (json|toon)"
+                    return $?
+                fi
+                ROBOT_FORMAT_OVERRIDE="$2"
+                shift 2
+                ;;
+            --format=*)
+                ROBOT_FORMAT_OVERRIDE="${1#*=}"
+                shift
+                ;;
             -w|--workflow)
                 if [[ -z "${2:-}" ]]; then
-                    robot_json false "missing_argument" '{"option":"-w"}' "Option -w requires a workflow name"
-                    exit $EXIT_USAGE_ERROR
+                    robot_fail "usage_error" '{"option":"-w"}' "Option -w requires a workflow name"
+                    return $?
                 fi
                 if ! is_valid_workflow_name "$2"; then
-                    robot_json false "invalid_argument" "$(jq -nc --arg wf "$2" '{argument: "workflow", value: $wf}')" \
+                    robot_fail "usage_error" "$(jq -nc --arg wf "$2" '{argument: "workflow", value: $wf}')" \
                         "Workflow name may contain only letters, numbers, dots, hyphens, underscores"
-                    exit $EXIT_USAGE_ERROR
+                    return $?
                 fi
                 WORKFLOW="$2"
                 shift 2
@@ -5947,8 +6247,8 @@ cmd_robot() {
                 ;;
             -*)
                 # Use jq for proper escaping of user input in JSON
-                robot_json false "invalid_option" "$(jq -nc --arg opt "$1" '{option: $opt}')" "Unknown option: $1"
-                exit $EXIT_USAGE_ERROR
+                robot_fail "usage_error" "$(jq -nc --arg opt "$1" '{option: $opt}')" "Unknown option: $1"
+                return $?
                 ;;
             *)
                 if [[ -z "$robot_cmd" ]]; then
@@ -5960,6 +6260,14 @@ cmd_robot() {
                 ;;
         esac
     done
+
+    # Resolve robot output format:
+    # CLI (--format) > APR_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > json
+    ROBOT_FORMAT="$(robot_resolve_output_format "${ROBOT_FORMAT_OVERRIDE:-}")" || {
+        robot_fail "usage_error" "$(jq -nc --arg fmt "${ROBOT_FORMAT_OVERRIDE:-}" '{argument: "format", value: $fmt}')" \
+            "Format must be json or toon"
+        return $?
+    }
 
     robot_cmd="${robot_cmd:-help}"
 
@@ -5999,8 +6307,8 @@ cmd_robot() {
             ;;
         *)
             # Use jq for proper escaping of user input in JSON
-            robot_json false "unknown_command" "$(jq -nc --arg cmd "$robot_cmd" '{command: $cmd}')" "Unknown command. Try 'apr robot help'"
-            exit $EXIT_USAGE_ERROR
+            robot_fail "usage_error" "$(jq -nc --arg cmd "$robot_cmd" '{command: $cmd}')" "Unknown command. Try 'apr robot help'"
+            return $?
             ;;
     esac
 }

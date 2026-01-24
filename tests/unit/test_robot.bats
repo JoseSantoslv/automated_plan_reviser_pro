@@ -78,6 +78,19 @@ teardown() {
     [[ "$output" == "$compact" ]]
 }
 
+@test "robot_json: --format toon falls back to JSON when tru/toon.sh unavailable (stderr warning)" {
+    ROBOT_COMPACT=true
+    ROBOT_FORMAT="toon"
+
+    # Ensure we don't accidentally pick up a global toon.sh from the host.
+    unset TOON_SH_PATH TOON_TRU_BIN TOON_BIN 2>/dev/null || true
+
+    capture_streams robot_json true "ok" '{"value":4}'
+
+    assert_valid_json "$CAPTURED_STDOUT"
+    [[ "$CAPTURED_STDERR" == *"[toon] warn:"* ]]
+}
+
 # =============================================================================
 # robot_status() Tests
 # =============================================================================
@@ -123,10 +136,13 @@ teardown() {
     ROBOT_COMPACT=true
     cd "$TEST_PROJECT" || return 1
 
-    run robot_workflows
+    capture_streams robot_workflows
+    status="$CAPTURED_STATUS"
+    output="$CAPTURED_STDOUT"
 
     assert_failure
     assert_robot_error "$output" "not_configured"
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=not_configured"* ]]
 }
 
 @test "robot_workflows: lists workflow names and descriptions" {
@@ -156,6 +172,7 @@ teardown() {
     assert_robot_success "$output"
     assert_json_value "$output" ".data.commands.status" "System overview (config, workflows, oracle)"
     assert_json_value "$output" ".data.options[\"-w, --workflow NAME\"]" "Workflow name (default: from config)"
+    assert_json_value "$output" ".data.options[\"-f, --format FORMAT\"]" "Robot output format: json or toon (env: APR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)"
 }
 
 # =============================================================================
@@ -179,15 +196,18 @@ teardown() {
 # robot_validate() Tests
 # =============================================================================
 
-@test "robot_validate: returns validation_failed when missing config" {
+@test "robot_validate: returns not_configured when missing .apr config" {
     ROBOT_COMPACT=true
     cd "$TEST_PROJECT" || return 1
 
-    run robot_validate
+    capture_streams robot_validate 1
+    status="$CAPTURED_STATUS"
+    output="$CAPTURED_STDOUT"
 
     assert_failure
-    assert_robot_error "$output" "validation_failed"
+    assert_robot_error "$output" "not_configured"
     assert_json_value "$output" ".data.valid" "false"
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=not_configured"* ]]
 }
 
 @test "robot_validate: returns ok for valid workflow and round" {
@@ -209,15 +229,18 @@ teardown() {
 # robot_history() and robot_run() error paths
 # =============================================================================
 
-@test "robot_history: returns not_found when rounds directory missing" {
+@test "robot_history: returns validation_failed when rounds directory missing" {
     ROBOT_COMPACT=true
     cd "$TEST_PROJECT" || return 1
     WORKFLOW="default"
 
-    run robot_history
+    capture_streams robot_history
+    status="$CAPTURED_STATUS"
+    output="$CAPTURED_STDOUT"
 
     assert_failure
-    assert_robot_error "$output" "not_found"
+    assert_robot_error "$output" "validation_failed"
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
 }
 
 @test "robot_history: returns sorted rounds when present" {
@@ -238,13 +261,16 @@ teardown() {
     assert_json_value "$output" ".data.rounds[1].round" "2"
 }
 
-@test "robot_run: returns invalid_argument for non-numeric round" {
+@test "robot_run: returns usage_error for non-numeric round" {
     ROBOT_COMPACT=true
 
-    run robot_run "abc"
+    capture_streams robot_run "abc"
+    status="$CAPTURED_STATUS"
+    output="$CAPTURED_STDOUT"
 
     assert_failure
-    assert_robot_error "$output" "invalid_argument"
+    assert_robot_error "$output" "usage_error"
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=usage_error"* ]]
 }
 
 @test "robot_run: starts oracle process in background" {
@@ -268,15 +294,18 @@ teardown() {
 # robot_stats() error path
 # =============================================================================
 
-@test "robot_stats: returns not_found when metrics missing" {
+@test "robot_stats: returns validation_failed when metrics missing" {
     ROBOT_COMPACT=true
     cd "$TEST_PROJECT" || return 1
     WORKFLOW="default"
 
-    run robot_stats
+    capture_streams robot_stats
+    status="$CAPTURED_STATUS"
+    output="$CAPTURED_STDOUT"
 
     assert_failure
-    assert_robot_error "$output" "not_found"
+    assert_robot_error "$output" "validation_failed"
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
 }
 
 @test "robot_diff: compares rounds with correct direction" {

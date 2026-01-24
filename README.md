@@ -109,6 +109,16 @@ apr update                     # Self-update
 
 ## Robot Mode (JSON API)
 
+Robot mode defaults to JSON, and can also emit TOON (token-optimized) when
+`tru` (toon_rust) is installed:
+
+```bash
+apr robot status --format toon
+```
+
+Format precedence:
+`--format` > `APR_OUTPUT_FORMAT` > `TOON_DEFAULT_FORMAT` > `json`.
+
 apr robot status               # {configured, workflows, oracle_available}
 apr robot workflows            # [{name, description}, ...]
 apr robot init                 # Create .apr/
@@ -118,7 +128,7 @@ apr robot history              # List completed rounds
 apr robot help                 # API docs
 
 Response: {ok, code, data, hint?, meta: {v, ts}}
-Codes: ok | not_configured | not_found | validation_failed | oracle_error | dependency_missing | missing_argument | invalid_argument | already_exists | config_error | invalid_option | unknown_command | init_failed
+Codes: ok | usage_error | not_configured | config_error | validation_failed | dependency_missing | busy | internal_error
 
 ## Key Paths
 
@@ -963,23 +973,23 @@ All robot mode commands return a consistent JSON envelope:
 }
 ```
 
-When errors occur, `ok` becomes `false` and `code` contains a semantic error identifier:
+On failure, `ok` becomes `false` and `code` contains a stable, semantic failure class. For grep-friendly automation, fatal failures also emit a single-line stderr tag:
+
+`APR_ERROR_CODE=<code>`
 
 | Code | Meaning |
 |------|---------|
 | `ok` | Success |
-| `not_configured` | No `.apr/` directory found |
-| `not_found` | Requested resource doesn't exist |
-| `validation_failed` | Preconditions not met |
-| `oracle_error` | Oracle invocation failed |
-| `missing_argument` | Required argument not provided |
-| `dependency_missing` | jq or Oracle not available |
-| `invalid_argument` | Argument provided but invalid |
-| `invalid_option` | Unknown CLI option |
-| `unknown_command` | Unknown robot subcommand |
-| `already_exists` | Refusing to overwrite existing output |
-| `config_error` | Configuration error (e.g. cannot create output dir) |
-| `init_failed` | Failed to initialize `.apr/` |
+| `usage_error` | Bad arguments (missing/invalid round/workflow/option) |
+| `not_configured` | No `.apr/` directory / not initialized |
+| `config_error` | Workflow/config invalid (missing fields/files, cannot create dirs) |
+| `validation_failed` | Preconditions not met (prompt QC, output exists, metrics missing) |
+| `dependency_missing` | Required dependency missing (e.g. oracle/jq) |
+| `busy` | Single-flight/busy (lock held / cannot proceed without waiting) |
+| `network_error` | Network/remote unreachable (when remote mode is used) |
+| `update_error` | Self-update failed |
+| `not_implemented` | Feature unsupported in this install |
+| `internal_error` | Unexpected failure (bug/unknown state) |
 
 ### Commands
 
